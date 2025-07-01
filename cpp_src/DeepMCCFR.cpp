@@ -7,13 +7,13 @@
 
 namespace ofc {
 
-// Конструктор теперь принимает указатели на SampleQueue и InferenceQueue
+// Конструктор
 DeepMCCFR::DeepMCCFR(size_t action_limit, SampleQueue* sample_queue, InferenceQueue* inference_queue) 
     : action_limit_(action_limit), sample_queue_(sample_queue), inference_queue_(inference_queue), rng_(std::random_device{}()) {
     local_buffer_.reserve(LOCAL_BUFFER_CAPACITY);
 }
 
-// Деструктор сбрасывает остатки из локального буфера при завершении потока
+// Деструктор
 DeepMCCFR::~DeepMCCFR() {
     if (!local_buffer_.empty()) {
         flush_local_buffer();
@@ -166,7 +166,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         true_regrets[i] = action_utils[i][current_player] - node_util[current_player];
     }
     
-    // Сохраняем сэмпл в локальный буфер, а не в глобальный
+    // Сохраняем сэмпл в локальный буфер
     local_buffer_.push_back({std::move(infoset_vec), std::move(true_regrets), num_actions});
     if (local_buffer_.size() >= LOCAL_BUFFER_CAPACITY) {
         flush_local_buffer();
