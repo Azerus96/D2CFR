@@ -7,47 +7,42 @@
 
 namespace ofc {
 
-// Конструктор
-DeepMCCFR::DeepMCCFR(size_t action_limit, SampleQueue* sample_queue, InferenceQueue* inference_queue) 
-    : action_limit_(action_limit), sample_queue_(sample_queue), inference_queue_(inference_queue), rng_(std::random_device{}()) {
+DeepMCCFR::DeepMCCFR(size_t action_limit, SampleQueue* sample_queue, InferenceQueue* inference_queue, std::atomic<bool>* stop_flag) 
+    : action_limit_(action_limit), sample_queue_(sample_queue), inference_queue_(inference_queue), stop_flag_(stop_flag), rng_(std::random_device{}()) {
     local_buffer_.reserve(LOCAL_BUFFER_CAPACITY);
 }
 
-// Деструктор
 DeepMCCFR::~DeepMCCFR() {
     if (!local_buffer_.empty()) {
         flush_local_buffer();
     }
 }
 
-// "Упаковывает" накопленные сэмплы и отправляет их в SampleQueue
 void DeepMCCFR::flush_local_buffer() {
     if (local_buffer_.empty()) return;
-
     SampleBatch batch;
     batch.infosets.reserve(local_buffer_.size());
     batch.regrets.reserve(local_buffer_.size());
     batch.num_actions.reserve(local_buffer_.size());
-
     for (auto& sample : local_buffer_) {
         batch.infosets.push_back(std::move(sample.infoset_vector));
         batch.regrets.push_back(std::move(sample.regrets_vector));
         batch.num_actions.push_back(sample.num_actions);
     }
-    
     sample_queue_->push(std::move(batch));
     local_buffer_.clear();
 }
 
-// Главная точка входа для одного цикла работы воркера
-void DeepMCCFR::run_traversal() {
+void DeepMCCFR::run_traversal_loop() {
     GameState state; 
-    traverse(state, 0);
-    state.reset(); 
-    traverse(state, 1);
+    while (!stop_flag_->load()) {
+        traverse(state, 0);
+        state.reset(); 
+        traverse(state, 1);
+        state.reset();
+    }
 }
 
-// Функция преобразования состояния игры в вектор признаков (инфосет)
 std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view) {
     const Board& my_board = state.get_player_board(player_view);
     const Board& opp_board = state.get_opponent_board(player_view);
@@ -89,28 +84,22 @@ std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view)
     return features;
 }
 
-// Рекурсивная функция обхода дерева игры
 std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player) {
     if (state.is_terminal()) {
         auto payoffs = state.get_payoffs(evaluator_);
         return {{0, payoffs.first}, {1, payoffs.second}};
     }
-
     int current_player = state.get_current_player();
-    
     std::vector<Action> legal_actions;
     state.get_legal_actions(action_limit_, legal_actions, rng_);
-    
     int num_actions = legal_actions.size();
     UndoInfo undo_info;
-
     if (num_actions == 0) {
         state.apply_action({{}, INVALID_CARD}, traversing_player, undo_info);
         auto result = traverse(state, traversing_player);
         state.undo_action(undo_info, traversing_player);
         return result;
     }
-
     if (current_player != traversing_player) {
         int action_idx = std::uniform_int_distribution<int>(0, num_actions - 1)(rng_);
         state.apply_action(legal_actions[action_idx], traversing_player, undo_info);
@@ -118,60 +107,47 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         state.undo_action(undo_info, traversing_player);
         return result;
     }
-
     std::vector<float> infoset_vec = featurize(state, traversing_player);
-    
     std::vector<float> regrets;
     {
         std::promise<std::vector<float>> promise;
         std::future<std::vector<float>> future = promise.get_future();
-
         InferenceRequest request;
-        request.infoset = infoset_vec; // Копируем, т.к. infoset_vec понадобится ниже
+        request.infoset = infoset_vec;
         request.promise = std::move(promise);
         request.num_actions = num_actions;
         inference_queue_->push(std::move(request));
-
         regrets = future.get();
     }
-
     std::vector<float> strategy(num_actions);
     float total_positive_regret = 0.0f;
     for (int i = 0; i < num_actions; ++i) {
         strategy[i] = (regrets[i] > 0) ? regrets[i] : 0.0f;
         total_positive_regret += strategy[i];
     }
-
     if (total_positive_regret > 0) {
         for (int i = 0; i < num_actions; ++i) strategy[i] /= total_positive_regret;
     } else {
         std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
     }
-
     std::vector<std::map<int, float>> action_utils(num_actions);
     std::map<int, float> node_util = {{0, 0.0f}, {1, 0.0f}};
-
     for (int i = 0; i < num_actions; ++i) {
         state.apply_action(legal_actions[i], traversing_player, undo_info);
         action_utils[i] = traverse(state, traversing_player);
         state.undo_action(undo_info, traversing_player);
-
         for(auto const& [player_idx, util] : action_utils[i]) {
             node_util[player_idx] += strategy[i] * util;
         }
     }
-
     std::vector<float> true_regrets(num_actions);
     for(int i = 0; i < num_actions; ++i) {
         true_regrets[i] = action_utils[i][current_player] - node_util[current_player];
     }
-    
-    // Сохраняем сэмпл в локальный буфер
     local_buffer_.push_back({std::move(infoset_vec), std::move(true_regrets), num_actions});
     if (local_buffer_.size() >= LOCAL_BUFFER_CAPACITY) {
         flush_local_buffer();
     }
-
     return node_util;
 }
 
