@@ -11,8 +11,13 @@ from concurrent.futures import ThreadPoolExecutor
 import subprocess
 
 # --- НАСТРОЙКИ ---
-NUM_WORKERS = int(os.cpu_count() or 96) 
+# Оставляем несколько ядер для Python и ОС, чтобы избежать "драки" за ресурсы
+NUM_CPP_WORKERS = int(os.cpu_count() or 96) - 8 
+# Количество потоков для вычислений PyTorch
 NUM_COMPUTATION_THREADS = "8"
+# --- НОВОЕ: Количество потоков для инференса, должно совпадать с NUM_COMPUTATION_THREADS ---
+NUM_INFERENCE_WORKERS = 8 
+
 os.environ['OMP_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['OPENBLAS_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['MKL_NUM_THREADS'] = NUM_COMPUTATION_THREADS
@@ -27,65 +32,55 @@ from ofc_engine import DeepMCCFR, SharedReplayBuffer, InferenceQueue
 INPUT_SIZE = 1486 
 ACTION_LIMIT = 100
 LEARNING_RATE = 0.001
-REPLAY_BUFFER_CAPACITY = 2_000_000
-BATCH_SIZE = 4096
-SAVE_INTERVAL_SECONDS = 120
+REPLAY_BUFFER_CAPACITY = 5_000_000 # Увеличим буфер для более стабильного обучения
+BATCH_SIZE = 8192 # Увеличим батч для обучения, чтобы лучше утилизировать CPU
+SAVE_INTERVAL_SECONDS = 1800
 MODEL_PATH = "d2cfr_model.pth"
 
 # Параметры для пакетного инференса
-INFERENCE_BATCH_SIZE = 2048
-INFERENCE_MAX_DELAY_MS = 2
+INFERENCE_BATCH_SIZE = 1024 # Оптимальный размер батча для пула воркеров
+INFERENCE_MAX_DELAY_MS = 1 # Минимальная задержка для отзывчивости
 
 class InferenceWorker(threading.Thread):
-    def __init__(self, model, queue, device):
+    def __init__(self, model_provider, queue, device, worker_id):
         super().__init__(daemon=True)
+        self.model_provider = model_provider
         self.queue = queue
         self.device = device
+        self.worker_id = worker_id
         self.stop_event = threading.Event()
-        self.model_lock = threading.Lock()
-        self.set_model(model)
-
-    def set_model(self, model):
-        with self.model_lock:
-            self.model = torch.quantization.quantize_dynamic(model.eval(), {torch.nn.Linear}, dtype=torch.qint8)
 
     def run(self):
-        print(f"InferenceWorker (ThreadID: {threading.get_ident()}) started.", flush=True)
-        requests = []
-        last_process_time = time.monotonic()
+        print(f"InferenceWorker-{self.worker_id} (ThreadID: {threading.get_ident()}) started.", flush=True)
+        model = self.model_provider.get_model()
         
         while not self.stop_event.is_set():
             try:
+                if self.model_provider.is_updated(self.worker_id):
+                    model = self.model_provider.get_model()
+                    self.model_provider.mark_updated(self.worker_id)
+                    print(f"InferenceWorker-{self.worker_id} updated model.", flush=True)
+
                 self.queue.wait() 
-                requests.extend(self.queue.pop_all())
+                requests = self.queue.pop_all()
                 
                 if not requests:
                     continue
-
-                current_time = time.monotonic()
-                time_since_last_process = (current_time - last_process_time) * 1000
-
-                if len(requests) >= INFERENCE_BATCH_SIZE or time_since_last_process > INFERENCE_MAX_DELAY_MS:
-                    self.process_batch(requests)
-                    requests.clear()
-                    last_process_time = current_time
+                
+                self.process_batch(requests, model)
 
             except Exception as e:
-                print(f"Error in InferenceWorker: {e}", flush=True)
+                print(f"Error in InferenceWorker-{self.worker_id}: {e}", flush=True)
                 traceback.print_exc()
-        
-        if requests:
-            self.process_batch(requests)
 
-        print(f"InferenceWorker (ThreadID: {threading.get_ident()}) stopped.", flush=True)
+        print(f"InferenceWorker-{self.worker_id} (ThreadID: {threading.get_ident()}) stopped.", flush=True)
 
-    def process_batch(self, requests):
+    def process_batch(self, requests, model):
         infosets = [req.infoset for req in requests]
         tensor = torch.tensor(infosets, dtype=torch.float32).to(self.device)
 
-        with self.model_lock:
-            with torch.no_grad():
-                results_tensor = self.model(tensor)
+        with torch.no_grad():
+            results_tensor = model(tensor)
         
         results_list = results_tensor.cpu().numpy()
 
@@ -95,6 +90,30 @@ class InferenceWorker(threading.Thread):
 
     def stop(self):
         self.stop_event.set()
+
+class InferenceModelProvider:
+    def __init__(self, model, device, num_workers):
+        self.device = device
+        self.num_workers = num_workers
+        self.model_lock = threading.Lock()
+        self.updated_flags = [True] * num_workers
+        self.set_model(model)
+
+    def set_model(self, model):
+        with self.model_lock:
+            self.model = torch.quantization.quantize_dynamic(model.eval(), {torch.nn.Linear}, dtype=torch.qint8)
+            self.updated_flags = [True] * self.num_workers
+        print("New inference model is ready for all workers.", flush=True)
+
+    def get_model(self):
+        with self.model_lock:
+            return self.model
+
+    def is_updated(self, worker_id):
+        return self.updated_flags[worker_id]
+
+    def mark_updated(self, worker_id):
+        self.updated_flags[worker_id] = False
 
 def push_to_github(model_path, commit_message):
     try:
@@ -127,36 +146,40 @@ def main():
     replay_buffer = SharedReplayBuffer(REPLAY_BUFFER_CAPACITY, ACTION_LIMIT)
     inference_queue = InferenceQueue()
 
-    inference_worker = InferenceWorker(model, inference_queue, device)
-    inference_worker.start()
+    model_provider = InferenceModelProvider(model, device, NUM_INFERENCE_WORKERS)
+    inference_workers = [
+        InferenceWorker(model_provider, inference_queue, device, i)
+        for i in range(NUM_INFERENCE_WORKERS)
+    ]
+    for worker in inference_workers:
+        worker.start()
 
-    solvers = [DeepMCCFR(ACTION_LIMIT, replay_buffer, inference_queue) for _ in range(NUM_WORKERS)]
+    solvers = [DeepMCCFR(ACTION_LIMIT, replay_buffer, inference_queue) for _ in range(NUM_CPP_WORKERS)]
     
     stop_event = threading.Event()
     total_samples_generated = 0
     git_thread = None
 
     try:
-        with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=NUM_CPP_WORKERS) as executor:
             def worker_loop(solver):
                 while not stop_event.is_set():
                     solver.run_traversal()
 
-            print(f"Submitting {NUM_WORKERS} long-running C++ worker tasks...", flush=True)
+            print(f"Submitting {NUM_CPP_WORKERS} long-running C++ worker tasks...", flush=True)
             futures = {executor.submit(worker_loop, s) for s in solvers}
             
             last_save_time = time.time()
             last_report_time = time.time()
             last_buffer_size = 0
-            loss = None # Инициализируем loss
+            loss = None
 
             while True:
-                time.sleep(0.1) 
+                time.sleep(0.1)
                 
                 current_buffer_size = replay_buffer.get_count()
                 now = time.time()
                 
-                # --- Обучение (ПРАВИЛЬНАЯ ЛОГИКА) ---
                 if current_buffer_size >= last_buffer_size + BATCH_SIZE:
                     model.train()
                     infosets_np, targets_np = replay_buffer.sample(BATCH_SIZE)
@@ -171,11 +194,10 @@ def main():
                     clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     
-                    inference_worker.set_model(model)
+                    model_provider.set_model(model)
                     
                     last_buffer_size = current_buffer_size
                 
-                # --- Отчет о производительности и сохранение ---
                 if now - last_report_time > 10.0:
                     duration = now - last_report_time
                     samples_generated_interval = current_buffer_size - total_samples_generated
@@ -209,8 +231,20 @@ def main():
     finally:
         print("Stopping workers...")
         stop_event.set()
-        inference_worker.stop()
+        for worker in inference_workers:
+            worker.stop()
         
+        # Ждем завершения C++ воркеров
+        for future in futures:
+            try:
+                future.result(timeout=5)
+            except Exception as e:
+                print(f"C++ worker finished with an exception: {e}")
+
+        # Ждем завершения инференс-воркеров
+        for worker in inference_workers:
+            worker.join(timeout=5)
+
         if git_thread and git_thread.is_alive():
             print("Waiting for the final Git push to complete...")
             git_thread.join()
