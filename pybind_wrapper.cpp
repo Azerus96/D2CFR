@@ -32,14 +32,24 @@ PYBIND11_MODULE(ofc_engine, m) {
 
     py::class_<ofc::SampleQueue>(m, "SampleQueue")
         .def(py::init<>())
-        // --- ИЗМЕНЕНИЕ: Явно указываем тип возвращаемого значения лямбды ---
-        .def("pop", [](ofc::SampleQueue& q) -> py::object { // <-- Указываем, что возвращаем py::object
+        // --- ИЗМЕНЕНИЕ: Правильное управление GIL ---
+        .def("pop", [](ofc::SampleQueue& q) -> py::object {
             ofc::SampleBatch batch;
-            if (q.pop(batch)) {
+            bool success = false;
+
+            // Шаг 1: Выполняем блокирующую операцию БЕЗ GIL.
+            // Поток ReplayBufferWriter "заснет" здесь, не мешая другим Python-потокам.
+            {
+                py::gil_scoped_release release;
+                success = q.pop(batch);
+            }
+
+            // Шаг 2: GIL автоматически захватывается обратно. Теперь можно безопасно работать с Python-объектами.
+            if (success) {
                 return py::cast(batch);
             }
-            return py::none(); // py::none() автоматически приводится к py::object
-        }, py::call_guard<py::gil_scoped_release>());
+            return py::none();
+        });
     // --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     py::class_<ofc::SharedReplayBuffer>(m, "SharedReplayBuffer")
