@@ -69,10 +69,12 @@ PYBIND11_MODULE(ofc_engine, m) {
             return std::make_pair(infosets_np, regrets_np);
         }, py::arg("batch_size"));
 
+    // --- ИЗМЕНЕНИЕ: Явно указываем, какую версию 'load' и 'store' использовать ---
     py::class_<std::atomic<bool>>(m, "AtomicBool")
         .def(py::init<bool>())
-        .def("load", &std::atomic<bool>::load)
-        .def("store", &std::atomic<bool>::store);
+        .def("load", static_cast<bool (std::atomic<bool>::*)() const noexcept>(&std::atomic<bool>::load))
+        .def("store", static_cast<void (std::atomic<bool>::*)(bool) noexcept>(&std::atomic<bool>::store));
+    // --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     py::class_<ofc::DeepMCCFR>(m, "DeepMCCFR")
         .def(py::init<size_t, ofc::SampleQueue*, InferenceQueue*, std::atomic<bool>*>(), 
