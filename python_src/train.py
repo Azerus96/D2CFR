@@ -23,7 +23,8 @@ os.environ['NUMEXPR_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 torch.set_num_threads(int(NUM_COMPUTATION_THREADS))
 
 from .model import DuelingNetwork
-from ofc_engine import DeepMCCFR, SharedReplayBuffer, InferenceQueue
+# --- ИЗМЕНЕНИЕ: Импортируем новые классы ---
+from ofc_engine import DeepMCCFR, SharedReplayBuffer, InferenceQueue, SampleQueue
 
 # --- ГИПЕРПАРАМЕТРЫ ---
 INPUT_SIZE = 1486 
@@ -33,9 +34,9 @@ REPLAY_BUFFER_CAPACITY = 5_000_000
 BATCH_SIZE = 8192
 SAVE_INTERVAL_SECONDS = 1800
 MODEL_PATH = "d2cfr_model.pth"
-
 INFERENCE_BATCH_SIZE = 1024
 
+# ... (Классы InferenceWorker и InferenceModelProvider без изменений) ...
 class InferenceWorker(threading.Thread):
     def __init__(self, model_provider, queue, device, worker_id):
         super().__init__(daemon=True)
@@ -43,7 +44,6 @@ class InferenceWorker(threading.Thread):
         self.queue = queue
         self.device = device
         self.worker_id = worker_id
-        # --- ИЗМЕНЕНИЕ: Используем общий stop_event из model_provider ---
         self.stop_event = self.model_provider.stop_event
 
     def run(self):
@@ -59,29 +59,22 @@ class InferenceWorker(threading.Thread):
                 requests = self.queue.pop_n(INFERENCE_BATCH_SIZE)
                 
                 if not requests:
-                    # Если pop_n вернул пустой вектор, это может быть сигнал остановки
-                    if self.stop_event.is_set():
-                        break
+                    if self.stop_event.is_set(): break
                     continue
                 
                 self.process_batch(requests, model)
-
             except Exception as e:
                 if not self.stop_event.is_set():
                     print(f"Error in InferenceWorker-{self.worker_id}: {e}", flush=True)
                     traceback.print_exc()
-
         print(f"InferenceWorker-{self.worker_id} (ThreadID: {threading.get_ident()}) stopped.", flush=True)
 
     def process_batch(self, requests, model):
         infosets = [req.infoset for req in requests]
         tensor = torch.tensor(infosets, dtype=torch.float32).to(self.device)
-
         with torch.no_grad():
             results_tensor = model(tensor)
-        
         results_list = results_tensor.cpu().numpy()
-
         for i, req in enumerate(requests):
             result = results_list[i][:req.num_actions].tolist()
             req.set_result(result)
@@ -92,7 +85,7 @@ class InferenceModelProvider:
         self.num_workers = num_workers
         self.model_lock = threading.Lock()
         self.updated_flags = [True] * num_workers
-        self.stop_event = threading.Event() # <-- Общий флаг остановки
+        self.stop_event = threading.Event()
         self.set_model(model)
 
     def set_model(self, model):
@@ -111,7 +104,35 @@ class InferenceModelProvider:
     def mark_updated(self, worker_id):
         self.updated_flags[worker_id] = False
 
+# --- НОВОЕ: Поток для записи в Replay Buffer ---
+class ReplayBufferWriter(threading.Thread):
+    def __init__(self, sample_queue, replay_buffer):
+        super().__init__(daemon=True)
+        self.sample_queue = sample_queue
+        self.replay_buffer = replay_buffer
+        self.stop_event = threading.Event()
+
+    def run(self):
+        print(f"ReplayBufferWriter (ThreadID: {threading.get_ident()}) started.", flush=True)
+        while not self.stop_event.is_set():
+            try:
+                batch = self.sample_queue.pop()
+                if not batch.infosets: # Сигнал остановки
+                    if self.stop_event.is_set(): break
+                    continue
+                self.replay_buffer.push_batch(batch)
+            except Exception as e:
+                if not self.stop_event.is_set():
+                    print(f"Error in ReplayBufferWriter: {e}", flush=True)
+                    traceback.print_exc()
+        print(f"ReplayBufferWriter (ThreadID: {threading.get_ident()}) stopped.", flush=True)
+
+    def stop(self):
+        self.stop_event.set()
+        self.sample_queue.stop()
+
 def push_to_github(model_path, commit_message):
+    # ... (код без изменений)
     try:
         print("Pushing progress to GitHub...", flush=True)
         subprocess.run(['git', 'config', '--global', 'user.email', 'bot@example.com'], check=True)
@@ -124,6 +145,7 @@ def push_to_github(model_path, commit_message):
         print(f"Failed to push to GitHub: {e}", flush=True)
     except Exception as e:
         print(f"An unexpected error occurred during git push: {e}", flush=True)
+
 
 def main():
     device = torch.device("cpu")
@@ -139,18 +161,22 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.MSELoss()
 
+    # --- ИЗМЕНЕНИЕ: Создаем все три очереди/буфера ---
     replay_buffer = SharedReplayBuffer(REPLAY_BUFFER_CAPACITY, ACTION_LIMIT)
     inference_queue = InferenceQueue()
+    sample_queue = SampleQueue()
 
+    # --- Запускаем все служебные потоки ---
     model_provider = InferenceModelProvider(model, device, NUM_INFERENCE_WORKERS)
-    inference_workers = [
-        InferenceWorker(model_provider, inference_queue, device, i)
-        for i in range(NUM_INFERENCE_WORKERS)
-    ]
+    inference_workers = [InferenceWorker(model_provider, inference_queue, device, i) for i in range(NUM_INFERENCE_WORKERS)]
+    replay_buffer_writer = ReplayBufferWriter(sample_queue, replay_buffer)
+
     for worker in inference_workers:
         worker.start()
+    replay_buffer_writer.start()
 
-    solvers = [DeepMCCFR(ACTION_LIMIT, replay_buffer, inference_queue) for _ in range(NUM_CPP_WORKERS)]
+    # --- ИЗМЕНЕНИЕ: C++ воркеры теперь получают SampleQueue ---
+    solvers = [DeepMCCFR(ACTION_LIMIT, sample_queue, inference_queue) for _ in range(NUM_CPP_WORKERS)]
     
     stop_event = threading.Event()
     total_samples_generated = 0
@@ -228,9 +254,9 @@ def main():
         print("Stopping workers...")
         stop_event.set()
         
-        # --- ИЗМЕНЕНИЕ: Правильная и надежная остановка ---
         model_provider.stop_event.set()
-        inference_queue.stop() # Это разбудит все инференс-воркеры
+        inference_queue.stop()
+        replay_buffer_writer.stop()
         
         print("Waiting for C++ workers to finish...")
         for future in futures:
@@ -239,7 +265,8 @@ def main():
             except Exception as e:
                 print(f"C++ worker finished with an exception: {e}")
 
-        print("Waiting for inference workers to finish...")
+        print("Waiting for Python workers to finish...")
+        replay_buffer_writer.join(timeout=5)
         for worker in inference_workers:
             worker.join(timeout=5)
 
