@@ -182,6 +182,11 @@ def main():
             loss = None
 
             while True:
+                # Проверяем, не завершился ли какой-нибудь C++ воркер с ошибкой
+                for future in futures:
+                    if future.done() and future.exception():
+                        raise future.exception()
+
                 time.sleep(0.1)
                 
                 current_buffer_size = replay_buffer.get_count()
@@ -235,6 +240,9 @@ def main():
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.", flush=True)
+    except Exception as e:
+        print(f"\nAn unexpected error occurred in the main loop: {e}", flush=True)
+        traceback.print_exc()
     finally:
         print("Stopping workers...")
         stop_flag.store(True)
