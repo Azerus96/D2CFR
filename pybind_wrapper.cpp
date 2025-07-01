@@ -1,6 +1,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+#include <atomic> // <-- НОВАЯ ЗАВИСИМОСТЬ для std::atomic
+
 #include "cpp_src/DeepMCCFR.hpp"
 #include "cpp_src/SharedReplayBuffer.hpp"
 #include "cpp_src/InferenceQueue.hpp"
@@ -11,6 +13,13 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(ofc_engine, m) {
     m.doc() = "OFC Engine with Lock-Free Queues";
+
+    // --- НОВЫЙ КЛАСС: Обёртка для std::atomic<bool> ---
+    // Это позволит создавать и передавать его из Python в C++
+    py::class_<std::atomic<bool>>(m, "AtomicBool")
+        .def(py::init<bool>()) // Конструктор, принимающий bool
+        .def("load", &std::atomic<bool>::load) // Метод для чтения значения
+        .def("store", &std::atomic<bool>::store); // Метод для записи значения
 
     py::class_<InferenceQueue>(m, "InferenceQueue")
         .def(py::init<>())
@@ -32,24 +41,18 @@ PYBIND11_MODULE(ofc_engine, m) {
 
     py::class_<ofc::SampleQueue>(m, "SampleQueue")
         .def(py::init<>())
-        // --- ИЗМЕНЕНИЕ: Правильное управление GIL ---
         .def("pop", [](ofc::SampleQueue& q) -> py::object {
             ofc::SampleBatch batch;
             bool success;
-
-            // Шаг 1: Выполняем блокирующую операцию БЕЗ GIL
             {
                 py::gil_scoped_release release;
                 success = q.pop(batch);
             }
-
-            // Шаг 2: GIL автоматически захватывается обратно. Теперь можно работать с Python-объектами.
             if (success) {
                 return py::cast(batch);
             }
             return py::none();
         });
-    // --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     py::class_<ofc::SharedReplayBuffer>(m, "SharedReplayBuffer")
         .def(py::init<uint64_t, int>(), py::arg("capacity"), py::arg("action_limit"))
@@ -75,7 +78,9 @@ PYBIND11_MODULE(ofc_engine, m) {
         }, py::arg("batch_size"));
 
     py::class_<ofc::DeepMCCFR>(m, "DeepMCCFR")
-        .def(py::init<size_t, ofc::SampleQueue*, InferenceQueue*>(), 
-             py::arg("action_limit"), py::arg("sample_queue"), py::arg("inference_queue"))
-        .def("run_traversal", &ofc::DeepMCCFR::run_traversal, py::call_guard<py::gil_scoped_release>());
+        // ИСПРАВЛЕНИЕ 1: Конструктор DeepMCCFR теперь принимает 4 аргумента, включая указатель на AtomicBool
+        .def(py::init<size_t, ofc::SampleQueue*, InferenceQueue*, std::atomic<bool>*>(), 
+             py::arg("action_limit"), py::arg("sample_queue"), py::arg("inference_queue"), py::arg("stop_flag"))
+        // ИСПРАВЛЕНИЕ 2: Имя метода изменено с "run_traversal" на "run_traversal_loop"
+        .def("run_traversal_loop", &ofc::DeepMCCFR::run_traversal_loop, py::call_guard<py::gil_scoped_release>());
 }
