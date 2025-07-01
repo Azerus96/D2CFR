@@ -23,7 +23,6 @@ os.environ['NUMEXPR_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 torch.set_num_threads(int(NUM_COMPUTATION_THREADS))
 
 from .model import DuelingNetwork
-# --- ИЗМЕНЕНИЕ: Импортируем новые классы ---
 from ofc_engine import DeepMCCFR, SharedReplayBuffer, InferenceQueue, SampleQueue
 
 # --- ГИПЕРПАРАМЕТРЫ ---
@@ -36,7 +35,6 @@ SAVE_INTERVAL_SECONDS = 1800
 MODEL_PATH = "d2cfr_model.pth"
 INFERENCE_BATCH_SIZE = 1024
 
-# ... (Классы InferenceWorker и InferenceModelProvider без изменений) ...
 class InferenceWorker(threading.Thread):
     def __init__(self, model_provider, queue, device, worker_id):
         super().__init__(daemon=True)
@@ -104,7 +102,6 @@ class InferenceModelProvider:
     def mark_updated(self, worker_id):
         self.updated_flags[worker_id] = False
 
-# --- НОВОЕ: Поток для записи в Replay Buffer ---
 class ReplayBufferWriter(threading.Thread):
     def __init__(self, sample_queue, replay_buffer):
         super().__init__(daemon=True)
@@ -115,24 +112,17 @@ class ReplayBufferWriter(threading.Thread):
     def run(self):
         print(f"ReplayBufferWriter (ThreadID: {threading.get_ident()}) started.", flush=True)
         while not self.stop_event.is_set():
-            try:
-                batch = self.sample_queue.pop()
-                if not batch.infosets: # Сигнал остановки
-                    if self.stop_event.is_set(): break
-                    continue
+            batch = self.sample_queue.pop()
+            if batch is not None:
                 self.replay_buffer.push_batch(batch)
-            except Exception as e:
-                if not self.stop_event.is_set():
-                    print(f"Error in ReplayBufferWriter: {e}", flush=True)
-                    traceback.print_exc()
+            else:
+                time.sleep(0.001) 
         print(f"ReplayBufferWriter (ThreadID: {threading.get_ident()}) stopped.", flush=True)
 
     def stop(self):
         self.stop_event.set()
-        self.sample_queue.stop()
 
 def push_to_github(model_path, commit_message):
-    # ... (код без изменений)
     try:
         print("Pushing progress to GitHub...", flush=True)
         subprocess.run(['git', 'config', '--global', 'user.email', 'bot@example.com'], check=True)
@@ -145,7 +135,6 @@ def push_to_github(model_path, commit_message):
         print(f"Failed to push to GitHub: {e}", flush=True)
     except Exception as e:
         print(f"An unexpected error occurred during git push: {e}", flush=True)
-
 
 def main():
     device = torch.device("cpu")
@@ -161,12 +150,10 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.MSELoss()
 
-    # --- ИЗМЕНЕНИЕ: Создаем все три очереди/буфера ---
     replay_buffer = SharedReplayBuffer(REPLAY_BUFFER_CAPACITY, ACTION_LIMIT)
     inference_queue = InferenceQueue()
     sample_queue = SampleQueue()
 
-    # --- Запускаем все служебные потоки ---
     model_provider = InferenceModelProvider(model, device, NUM_INFERENCE_WORKERS)
     inference_workers = [InferenceWorker(model_provider, inference_queue, device, i) for i in range(NUM_INFERENCE_WORKERS)]
     replay_buffer_writer = ReplayBufferWriter(sample_queue, replay_buffer)
@@ -175,7 +162,6 @@ def main():
         worker.start()
     replay_buffer_writer.start()
 
-    # --- ИЗМЕНЕНИЕ: C++ воркеры теперь получают SampleQueue ---
     solvers = [DeepMCCFR(ACTION_LIMIT, sample_queue, inference_queue) for _ in range(NUM_CPP_WORKERS)]
     
     stop_event = threading.Event()
