@@ -1,13 +1,14 @@
 #pragma once
 #include <vector>
+#include <thread> // Для std::this_thread::sleep_for
+#include <chrono> // Для std::chrono::microseconds
 #include "constants.hpp"
-#include "concurrentqueue.h" // Используем новую lock-free библиотеку
+#include "concurrentqueue.h" // Используем lock-free библиотеку
 
 namespace ofc {
 
 // Структура, которую C++ воркеры будут класть в очередь
 struct SampleBatch {
-    // Мы будем перемещать векторы, чтобы избежать копирования
     std::vector<std::vector<float>> infosets;
     std::vector<std::vector<float>> regrets;
     std::vector<int> num_actions;
@@ -16,15 +17,23 @@ struct SampleBatch {
 // Обертка над lock-free очередью moodycamel::ConcurrentQueue
 class SampleQueue {
 public:
+    SampleQueue() {}
+
     // Операция enqueue здесь lock-free, много потоков могут вызывать ее одновременно без блокировок
     void push(SampleBatch&& batch) {
         queue_.enqueue(std::move(batch));
     }
 
-    // pop будет вызываться из одного Python-потока.
-    // Он неблокирующий: возвращает true, если элемент был извлечен, и false, если очередь пуста.
+    // Блокирующий pop, который будет вызываться из Python
     bool pop(SampleBatch& batch) {
-        return queue_.try_dequeue(batch);
+        // try_dequeue неблокирующий, поэтому мы должны сами организовать ожидание
+        // Это называется "активное ожидание" (spin-wait), оно эффективно, когда ожидание короткое.
+        while (!queue_.try_dequeue(batch)) {
+            // Если очередь пуста, немного "поспим", чтобы не грузить CPU впустую.
+            // Это компромисс между отзывчивостью и нагрузкой на CPU.
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        return true;
     }
 
 private:
