@@ -4,13 +4,13 @@
 #include "cpp_src/DeepMCCFR.hpp"
 #include "cpp_src/SharedReplayBuffer.hpp"
 #include "cpp_src/InferenceQueue.hpp"
-#include "cpp_src/SampleQueue.hpp" // <-- ДОБАВЛЕНО
+#include "cpp_src/SampleQueue.hpp"
 #include "cpp_src/constants.hpp"
 
 namespace py = pybind11;
 
 PYBIND11_MODULE(ofc_engine, m) {
-    m.doc() = "OFC Engine with Async Replay Buffer";
+    m.doc() = "OFC Engine with Lock-Free Queues";
 
     py::class_<InferenceQueue>(m, "InferenceQueue")
         .def(py::init<>())
@@ -24,23 +24,26 @@ PYBIND11_MODULE(ofc_engine, m) {
             req.promise.set_value(result);
         });
 
-    // --- НОВОЕ: Биндинги для SampleQueue ---
     py::class_<ofc::SampleBatch>(m, "SampleBatch")
+        .def(py::init<>())
         .def_readonly("infosets", &ofc::SampleBatch::infosets)
         .def_readonly("regrets", &ofc::SampleBatch::regrets)
         .def_readonly("num_actions", &ofc::SampleBatch::num_actions);
 
     py::class_<ofc::SampleQueue>(m, "SampleQueue")
         .def(py::init<>())
-        .def("pop", &ofc::SampleQueue::pop, py::call_guard<py::gil_scoped_release>())
-        .def("stop", &ofc::SampleQueue::stop);
-    // ------------------------------------
+        .def("pop", [](ofc::SampleQueue& q) {
+            ofc::SampleBatch batch;
+            if (q.pop(batch)) {
+                return py::cast(batch);
+            }
+            return py::none();
+        }, py::call_guard<py::gil_scoped_release>());
 
     py::class_<ofc::SharedReplayBuffer>(m, "SharedReplayBuffer")
         .def(py::init<uint64_t, int>(), py::arg("capacity"), py::arg("action_limit"))
         .def("get_count", &ofc::SharedReplayBuffer::get_count)
         .def("get_max_actions", &ofc::SharedReplayBuffer::get_max_actions)
-        // --- НОВОЕ: Метод для пакетного добавления ---
         .def("push_batch", [](ofc::SharedReplayBuffer &buffer, const ofc::SampleBatch& batch) {
             for (size_t i = 0; i < batch.infosets.size(); ++i) {
                 buffer.push(batch.infosets[i], batch.regrets[i], batch.num_actions[i]);
@@ -61,7 +64,6 @@ PYBIND11_MODULE(ofc_engine, m) {
         }, py::arg("batch_size"));
 
     py::class_<ofc::DeepMCCFR>(m, "DeepMCCFR")
-        // --- ИЗМЕНЕНИЕ: Конструктор принимает SampleQueue ---
         .def(py::init<size_t, ofc::SampleQueue*, InferenceQueue*>(), 
              py::arg("action_limit"), py::arg("sample_queue"), py::arg("inference_queue"))
         .def("run_traversal", &ofc::DeepMCCFR::run_traversal, py::call_guard<py::gil_scoped_release>());
