@@ -1,4 +1,4 @@
-# D2CFR-main/CMakeLists.txt (ВЕРСИЯ 10.0 - Lock-Free)
+# D2CFR-main/CMakeLists.txt (ВЕРСИЯ 10.1 - Исключение тестов)
 
 cmake_minimum_required(VERSION 3.10)
 project(OFCEngine)
@@ -17,15 +17,24 @@ FetchContent_MakeAvailable(pybind11)
 find_package(Torch REQUIRED)
 find_package(OpenMP REQUIRED)
 
-file(GLOB_RECURSE SOURCES "cpp_src/*.cpp")
-list(APPEND SOURCES "pybind_wrapper.cpp")
+# --- ИЗМЕНЕНИЕ: Явно указываем только нужные нам исходные файлы ---
+# Мы больше не используем GLOB_RECURSE, чтобы не захватить тесты и бенчмарки из concurrentqueue.
+set(SOURCES
+    "cpp_src/DeepMCCFR.cpp"
+    "cpp_src/game_state.cpp"
+    "cpp_src/ompeval/omp/CardRange.cpp"
+    "cpp_src/ompeval/omp/CombinedRange.cpp"
+    "cpp_src/ompeval/omp/EquityCalculator.cpp"
+    "cpp_src/ompeval/omp/HandEvaluator.cpp"
+    "pybind_wrapper.cpp"
+)
+# --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
 pybind11_add_module(ofc_engine SHARED ${SOURCES})
 
 target_include_directories(ofc_engine PRIVATE
     "${PROJECT_SOURCE_DIR}/cpp_src"
     "${PROJECT_SOURCE_DIR}/cpp_src/ompeval"
-    # --- ДОБАВЛЕНО: Путь к новой библиотеке ---
     "${PROJECT_SOURCE_DIR}/cpp_src/concurrentqueue" 
 )
 
