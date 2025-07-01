@@ -1,7 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
-#include <atomic> // <-- НОВАЯ ЗАВИСИМОСТЬ для std::atomic
+#include <atomic>
 
 #include "cpp_src/DeepMCCFR.hpp"
 #include "cpp_src/SharedReplayBuffer.hpp"
@@ -18,11 +18,13 @@ PYBIND11_MODULE(ofc_engine, m) {
     py::class_<std::atomic<bool>>(m, "AtomicBool")
         .def(py::init<bool>()) // Конструктор, принимающий bool
         
-        // ИСПРАВЛЕНИЕ: Явно указываем тип функции load, чтобы разрешить перегрузку
-        .def("load", static_cast<bool (std::atomic<bool>::*)() const>(&std::atomic<bool>::load))
-        
-        // ИСПРАВЛЕНИЕ: Явно указываем тип функции store
-        .def("store", static_cast<void (std::atomic<bool>::*)(bool)>(&std::atomic<bool>::store));
+        // ИСПРАВЛЕНИЕ: Используем лямбда-функции для вызова методов с аргументами по умолчанию
+        .def("load", [](const std::atomic<bool> &a) {
+            return a.load();
+        })
+        .def("store", [](std::atomic<bool> &a, bool val) {
+            a.store(val);
+        });
 
     py::class_<InferenceQueue>(m, "InferenceQueue")
         .def(py::init<>())
