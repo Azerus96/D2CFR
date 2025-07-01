@@ -11,10 +11,14 @@ from concurrent.futures import ThreadPoolExecutor
 import subprocess
 
 # --- НАСТРОЙКИ ---
-NUM_CPP_WORKERS = int(os.cpu_count() or 96) - 8 
+# Определяем количество воркеров. Оставляем 8 ядер для инференса, PyTorch и системы.
+# Если ядер меньше 9, используем 1 C++ воркер.
+cpu_count = os.cpu_count() or 1
+NUM_CPP_WORKERS = max(1, cpu_count - 8)
 NUM_COMPUTATION_THREADS = "8"
 NUM_INFERENCE_WORKERS = 8 
 
+# Установка переменных окружения для управления потоками в библиотеках
 os.environ['OMP_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['OPENBLAS_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['MKL_NUM_THREADS'] = NUM_COMPUTATION_THREADS
@@ -22,6 +26,7 @@ os.environ['VECLIB_MAXIMUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['NUMEXPR_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 torch.set_num_threads(int(NUM_COMPUTATION_THREADS))
 
+# Импортируем C++ модуль и модель
 from .model import DuelingNetwork
 from ofc_engine import DeepMCCFR, SharedReplayBuffer, InferenceQueue, SampleQueue, AtomicBool
 
@@ -31,11 +36,15 @@ ACTION_LIMIT = 100
 LEARNING_RATE = 0.001
 REPLAY_BUFFER_CAPACITY = 5_000_000
 BATCH_SIZE = 8192
-SAVE_INTERVAL_SECONDS = 1800
+SAVE_INTERVAL_SECONDS = 1800  # 30 минут
 MODEL_PATH = "d2cfr_model.pth"
 INFERENCE_BATCH_SIZE = 1024
 
 class InferenceWorker(threading.Thread):
+    """
+    Поток, который забирает запросы на инференс из очереди,
+    обрабатывает их батчами и возвращает результаты.
+    """
     def __init__(self, model_provider, queue, device, worker_id):
         super().__init__(daemon=True)
         self.model_provider = model_provider
@@ -43,41 +52,50 @@ class InferenceWorker(threading.Thread):
         self.device = device
         self.worker_id = worker_id
         self.stop_event = self.model_provider.stop_event
+        self.model = None
 
     def run(self):
         print(f"InferenceWorker-{self.worker_id} (ThreadID: {threading.get_ident()}) started.", flush=True)
-        model = self.model_provider.get_model()
         
         while not self.stop_event.is_set():
             try:
+                # Проверяем, не обновилась ли модель
                 if self.model_provider.is_updated(self.worker_id):
-                    model = self.model_provider.get_model()
+                    self.model = self.model_provider.get_model()
                     self.model_provider.mark_updated(self.worker_id)
                 
+                # Забираем батч запросов
                 requests = self.queue.pop_n(INFERENCE_BATCH_SIZE)
                 
                 if not requests:
                     if self.stop_event.is_set(): break
+                    time.sleep(0.001) # Небольшая пауза, чтобы не грузить CPU
                     continue
                 
-                self.process_batch(requests, model)
+                self.process_batch(requests)
             except Exception as e:
                 if not self.stop_event.is_set():
                     print(f"Error in InferenceWorker-{self.worker_id}: {e}", flush=True)
                     traceback.print_exc()
         print(f"InferenceWorker-{self.worker_id} (ThreadID: {threading.get_ident()}) stopped.", flush=True)
 
-    def process_batch(self, requests, model):
+    def process_batch(self, requests):
         infosets = [req.infoset for req in requests]
         tensor = torch.tensor(infosets, dtype=torch.float32).to(self.device)
         with torch.no_grad():
-            results_tensor = model(tensor)
+            results_tensor = self.model(tensor)
         results_list = results_tensor.cpu().numpy()
         for i, req in enumerate(requests):
+            # Отправляем результат обратно в C++ future
             result = results_list[i][:req.num_actions].tolist()
             req.set_result(result)
 
 class InferenceModelProvider:
+    """
+    Класс для безопасного доступа к модели из разных потоков.
+    Позволяет обновлять модель в главном потоке и сообщать
+    инференс-воркерам, что доступна новая версия.
+    """
     def __init__(self, model, device, num_workers):
         self.device = device
         self.num_workers = num_workers
@@ -88,9 +106,10 @@ class InferenceModelProvider:
 
     def set_model(self, model):
         with self.model_lock:
+            # Квантизация модели для ускорения инференса на CPU
             self.model = torch.quantization.quantize_dynamic(model.eval(), {torch.nn.Linear}, dtype=torch.qint8)
             self.updated_flags = [True] * self.num_workers
-        print("New inference model is ready for all workers.", flush=True)
+        # print("New inference model is ready for all workers.", flush=True)
 
     def get_model(self):
         with self.model_lock:
@@ -103,6 +122,10 @@ class InferenceModelProvider:
         self.updated_flags[worker_id] = False
 
 class ReplayBufferWriter(threading.Thread):
+    """
+    Поток, который забирает сгенерированные сэмплы из SampleQueue
+    и складывает их в общий буфер воспроизведения.
+    """
     def __init__(self, sample_queue, replay_buffer):
         super().__init__(daemon=True)
         self.sample_queue = sample_queue
@@ -124,16 +147,20 @@ class ReplayBufferWriter(threading.Thread):
         self.stop_event.set()
 
 def push_to_github(model_path, commit_message):
+    """
+    Функция для сохранения прогресса в Git.
+    """
     try:
         print("Pushing progress to GitHub...", flush=True)
-        subprocess.run(['git', 'config', '--global', 'user.email', 'bot@example.com'], check=True)
-        subprocess.run(['git', 'config', '--global', 'user.name', 'Training Bot'], check=True)
-        subprocess.run(['git', 'add', model_path], check=True)
-        subprocess.run(['git', 'commit', '-m', commit_message], check=True)
-        subprocess.run(['git', 'push'], check=True)
+        subprocess.run(['git', 'config', '--global', 'user.email', 'bot@example.com'], check=True, capture_output=True)
+        subprocess.run(['git', 'config', '--global', 'user.name', 'Training Bot'], check=True, capture_output=True)
+        subprocess.run(['git', 'add', model_path], check=True, capture_output=True)
+        subprocess.run(['git', 'commit', '-m', commit_message], check=True, capture_output=True)
+        subprocess.run(['git', 'push'], check=True, capture_output=True)
         print("Progress pushed successfully.", flush=True)
     except subprocess.CalledProcessError as e:
         print(f"Failed to push to GitHub: {e}", flush=True)
+        print(f"Git stderr: {e.stderr.decode()}", flush=True)
     except Exception as e:
         print(f"An unexpected error occurred during git push: {e}", flush=True)
 
@@ -145,7 +172,7 @@ def main():
         print(f"Found existing model at {MODEL_PATH}. Loading weights...", flush=True)
         try:
             model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-        except RuntimeError as e:
+        except Exception as e:
             print(f"Could not load state_dict. Error: {e}. Starting from scratch.", flush=True)
 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -156,9 +183,11 @@ def main():
     sample_queue = SampleQueue()
 
     model_provider = InferenceModelProvider(model, device, NUM_INFERENCE_WORKERS)
+    
+    # --- ЗАПУСК ВСЕХ ВОРКЕРОВ СРАЗУ ---
+    print("Starting Python workers (Inference, ReplayBufferWriter)...", flush=True)
     inference_workers = [InferenceWorker(model_provider, inference_queue, device, i) for i in range(NUM_INFERENCE_WORKERS)]
     replay_buffer_writer = ReplayBufferWriter(sample_queue, replay_buffer)
-
     for worker in inference_workers:
         worker.start()
     replay_buffer_writer.start()
@@ -167,76 +196,89 @@ def main():
     solvers = [DeepMCCFR(ACTION_LIMIT, sample_queue, inference_queue, stop_flag) for _ in range(NUM_CPP_WORKERS)]
     
     git_thread = None
+    futures = set()
+    executor = ThreadPoolExecutor(max_workers=NUM_CPP_WORKERS)
 
     try:
-        with ThreadPoolExecutor(max_workers=NUM_CPP_WORKERS) as executor:
-            def worker_loop(solver):
-                solver.run_traversal_loop()
-
-            print(f"Submitting {NUM_CPP_WORKERS} long-running C++ worker tasks...", flush=True)
-            futures = {executor.submit(worker_loop, s) for s in solvers}
+        # Запускаем C++ воркеры в фоновом режиме
+        print(f"Submitting {NUM_CPP_WORKERS} C++ worker tasks...", flush=True)
+        for s in solvers:
+            futures.add(executor.submit(s.run_traversal_loop))
+        
+        # --- ФАЗА НАПОЛНЕНИЯ БУФЕРА (WARM-UP) ---
+        print(f"Warm-up phase: waiting for Replay Buffer to contain at least {BATCH_SIZE} samples.", flush=True)
+        while replay_buffer.get_count() < BATCH_SIZE:
+            # Проверяем, не упал ли какой-то воркер
+            for future in list(futures):
+                if future.done() and future.exception():
+                    print("\nFATAL: C++ worker failed during warm-up!", flush=True)
+                    raise future.exception()
             
-            last_save_time = time.time()
-            last_report_time = time.time()
-            last_buffer_size = 0
-            loss = None
+            print(f"\rBuffer filling: {replay_buffer.get_count()}/{BATCH_SIZE}", end="", flush=True)
+            time.sleep(1)
+        
+        print("\nWarm-up complete. Starting main training loop.", flush=True)
 
-            while True:
-                # Проверяем, не завершился ли какой-нибудь C++ воркер с ошибкой
-                for future in futures:
-                    if future.done() and future.exception():
-                        raise future.exception()
+        # --- ОСНОВНОЙ ЦИКЛ ОБУЧЕНИЯ ---
+        last_save_time = time.time()
+        last_report_time = time.time()
+        total_samples_at_last_report = replay_buffer.get_count()
+        training_steps = 0
 
-                time.sleep(0.1)
-                
+        while True:
+            # Проверяем C++ воркеры на ошибки
+            for future in list(futures):
+                if future.done() and future.exception():
+                    raise future.exception()
+
+            # Обучение
+            model.train()
+            infosets_np, targets_np = replay_buffer.sample(BATCH_SIZE)
+            
+            infosets = torch.from_numpy(infosets_np).to(device)
+            targets = torch.from_numpy(targets_np).to(device)
+
+            optimizer.zero_grad()
+            predictions = model(infosets)
+            loss = criterion(predictions, targets)
+            loss.backward()
+            clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            training_steps += 1
+            
+            # Обновляем модель для инференса не слишком часто
+            if training_steps % 10 == 0:
+                model_provider.set_model(model)
+            
+            # Отчетность
+            now = time.time()
+            if now - last_report_time > 10.0:
                 current_buffer_size = replay_buffer.get_count()
-                now = time.time()
+                duration = now - last_report_time
+                samples_generated_interval = current_buffer_size - total_samples_at_last_report
+                samples_per_sec = samples_generated_interval / duration if duration > 0 else 0
                 
-                if current_buffer_size >= last_buffer_size + BATCH_SIZE:
-                    model.train()
-                    infosets_np, targets_np = replay_buffer.sample(BATCH_SIZE)
-                    
-                    infosets = torch.from_numpy(infosets_np).to(device)
-                    targets = torch.from_numpy(targets_np).to(device)
-
-                    optimizer.zero_grad()
-                    predictions = model(infosets)
-                    loss = criterion(predictions, targets)
-                    loss.backward()
-                    clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    
-                    model_provider.set_model(model)
-                    
-                    last_buffer_size = current_buffer_size
+                print(f"\n--- Stats (Step {training_steps}) ---", flush=True)
+                print(f"  Loss: {loss.item():.6f}", flush=True)
+                print(f"  Sample generation rate: {samples_per_sec:.2f} samples/s", flush=True)
+                print(f"  Replay Buffer: {current_buffer_size:,}/{REPLAY_BUFFER_CAPACITY:,} ({current_buffer_size/REPLAY_BUFFER_CAPACITY:.1%})", flush=True)
                 
-                if now - last_report_time > 10.0:
-                    duration = now - last_report_time
-                    samples_generated_interval = current_buffer_size - total_samples_generated
-                    total_samples_generated = current_buffer_size
-                    samples_per_sec = samples_generated_interval / duration if duration > 0 else 0
-                    
-                    print(f"\n--- Stats Update ---", flush=True)
-                    print(f"Throughput: {samples_per_sec:.2f} samples/s. Buffer: {current_buffer_size}/{REPLAY_BUFFER_CAPACITY}. Total generated: {total_samples_generated:,}", flush=True)
-                    
-                    if loss is not None:
-                        print(f"Last training loss: {loss.item():.6f}", flush=True)
+                total_samples_at_last_report = current_buffer_size
+                last_report_time = now
 
-                    last_report_time = now
-
-                    if now - last_save_time > SAVE_INTERVAL_SECONDS:
-                        if git_thread and git_thread.is_alive():
-                            print("Previous Git push is still running. Skipping this save.", flush=True)
-                        else:
-                            if loss is not None:
-                                print("\n--- Saving model and pushing to GitHub ---", flush=True)
-                                torch.save(model.state_dict(), MODEL_PATH)
-                                commit_message = f"Training checkpoint. Total samples: {total_samples_generated:,}. Loss: {loss.item():.6f}"
-                                
-                                git_thread = threading.Thread(target=push_to_github, args=(MODEL_PATH, commit_message))
-                                git_thread.start()
-                                
-                                last_save_time = now
+            # Сохранение
+            if now - last_save_time > SAVE_INTERVAL_SECONDS:
+                if git_thread and git_thread.is_alive():
+                    print("Previous Git push is still running. Skipping this save.", flush=True)
+                else:
+                    print("\n--- Saving model and pushing to GitHub ---", flush=True)
+                    torch.save(model.state_dict(), MODEL_PATH)
+                    commit_message = f"Training step {training_steps}. Loss: {loss.item():.6f}"
+                    
+                    git_thread = threading.Thread(target=push_to_github, args=(MODEL_PATH, commit_message))
+                    git_thread.start()
+                    
+                    last_save_time = now
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.", flush=True)
@@ -244,19 +286,17 @@ def main():
         print(f"\nAn unexpected error occurred in the main loop: {e}", flush=True)
         traceback.print_exc()
     finally:
-        print("Stopping workers...")
+        print("Stopping all workers...", flush=True)
         stop_flag.store(True)
         
         model_provider.stop_event.set()
         inference_queue.stop()
         replay_buffer_writer.stop()
         
-        print("Waiting for C++ workers to finish...")
-        for future in futures:
-            try:
-                future.result(timeout=5)
-            except Exception as e:
-                print(f"C++ worker finished with an exception: {e}")
+        if futures:
+            print("Shutting down C++ worker pool...")
+            # Не ждем завершения, просто отменяем задачи
+            executor.shutdown(wait=False, cancel_futures=True)
 
         print("Waiting for Python workers to finish...")
         replay_buffer_writer.join(timeout=5)
