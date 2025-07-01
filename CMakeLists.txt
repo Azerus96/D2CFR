@@ -1,12 +1,10 @@
-# D2CFR-main/CMakeLists.txt (ВЕРСИЯ 5.0 - ЕДИНЫЙ ИСТОЧНИК)
+# D2CFR-main/CMakeLists.txt (ВЕРСИЯ 10.0 - Lock-Free)
 
 cmake_minimum_required(VERSION 3.10)
 project(OFCEngine)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# УДАЛЕНО: Флаг ABI больше не нужен, так как мы будем линковаться с правильной версией.
 
 include(FetchContent)
 FetchContent_Declare(
@@ -16,7 +14,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(pybind11)
 
-# Эта команда найдет PyTorch, который был установлен через pip
 find_package(Torch REQUIRED)
 find_package(OpenMP REQUIRED)
 
@@ -28,17 +25,12 @@ pybind11_add_module(ofc_engine SHARED ${SOURCES})
 target_include_directories(ofc_engine PRIVATE
     "${PROJECT_SOURCE_DIR}/cpp_src"
     "${PROJECT_SOURCE_DIR}/cpp_src/ompeval"
+    # --- ДОБАВЛЕНО: Путь к новой библиотеке ---
+    "${PROJECT_SOURCE_DIR}/cpp_src/concurrentqueue" 
 )
 
-# Линкуемся с библиотеками, которые нашел find_package(Torch)
 target_link_libraries(ofc_engine PRIVATE OpenMP::OpenMP_CXX ${TORCH_LIBRARIES})
-
 target_compile_options(ofc_engine PRIVATE -O3 -g)
-
-# RPATH больше не нужен так как мы используем системные библиотеки
-# if(UNIX AND NOT APPLE)
-#     target_link_options(ofc_engine PRIVATE "-Wl,-rpath,${TORCH_INSTALL_PREFIX}/lib")
-# endif()
 
 message(STATUS "Pybind11 include dirs: ${pybind11_INCLUDE_DIRS}")
 message(STATUS "Torch libraries: ${TORCH_LIBRARIES}")
