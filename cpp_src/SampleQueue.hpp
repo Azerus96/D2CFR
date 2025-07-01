@@ -1,9 +1,7 @@
 #pragma once
 #include <vector>
-#include <mutex>
-#include <condition_variable>
-#include <deque>
 #include "constants.hpp"
+#include "concurrentqueue.h" // Используем новую lock-free библиотеку
 
 namespace ofc {
 
@@ -15,43 +13,22 @@ struct SampleBatch {
     std::vector<int> num_actions;
 };
 
-// Потокобезопасная очередь для готовых сэмплов
+// Обертка над lock-free очередью moodycamel::ConcurrentQueue
 class SampleQueue {
 public:
-    SampleQueue() : stop_flag_(false) {}
-
+    // Операция enqueue здесь lock-free, много потоков могут вызывать ее одновременно без блокировок
     void push(SampleBatch&& batch) {
-        std::unique_lock<std::mutex> lock(mtx_);
-        queue_.push_back(std::move(batch));
-        lock.unlock();
-        cv_.notify_one();
+        queue_.enqueue(std::move(batch));
     }
 
-    SampleBatch pop() {
-        std::unique_lock<std::mutex> lock(mtx_);
-        cv_.wait(lock, [this] { return !queue_.empty() || stop_flag_.load(); });
-
-        if (stop_flag_.load() && queue_.empty()) {
-            return {}; // Возвращаем пустой батч как сигнал завершения
-        }
-
-        SampleBatch batch = std::move(queue_.front());
-        queue_.pop_front();
-        return batch;
-    }
-
-    void stop() {
-        std::unique_lock<std::mutex> lock(mtx_);
-        stop_flag_.store(true);
-        lock.unlock();
-        cv_.notify_all();
+    // pop будет вызываться из одного Python-потока.
+    // Он неблокирующий: возвращает true, если элемент был извлечен, и false, если очередь пуста.
+    bool pop(SampleBatch& batch) {
+        return queue_.try_dequeue(batch);
     }
 
 private:
-    std::deque<SampleBatch> queue_;
-    std::mutex mtx_;
-    std::condition_variable cv_;
-    std::atomic<bool> stop_flag_;
+    moodycamel::ConcurrentQueue<SampleBatch> queue_;
 };
 
 }
