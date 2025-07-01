@@ -15,11 +15,14 @@ PYBIND11_MODULE(ofc_engine, m) {
     m.doc() = "OFC Engine with Lock-Free Queues";
 
     // --- НОВЫЙ КЛАСС: Обёртка для std::atomic<bool> ---
-    // Это позволит создавать и передавать его из Python в C++
     py::class_<std::atomic<bool>>(m, "AtomicBool")
         .def(py::init<bool>()) // Конструктор, принимающий bool
-        .def("load", &std::atomic<bool>::load) // Метод для чтения значения
-        .def("store", &std::atomic<bool>::store); // Метод для записи значения
+        
+        // ИСПРАВЛЕНИЕ: Явно указываем тип функции load, чтобы разрешить перегрузку
+        .def("load", static_cast<bool (std::atomic<bool>::*)() const>(&std::atomic<bool>::load))
+        
+        // ИСПРАВЛЕНИЕ: Явно указываем тип функции store
+        .def("store", static_cast<void (std::atomic<bool>::*)(bool)>(&std::atomic<bool>::store));
 
     py::class_<InferenceQueue>(m, "InferenceQueue")
         .def(py::init<>())
@@ -78,9 +81,7 @@ PYBIND11_MODULE(ofc_engine, m) {
         }, py::arg("batch_size"));
 
     py::class_<ofc::DeepMCCFR>(m, "DeepMCCFR")
-        // ИСПРАВЛЕНИЕ 1: Конструктор DeepMCCFR теперь принимает 4 аргумента, включая указатель на AtomicBool
         .def(py::init<size_t, ofc::SampleQueue*, InferenceQueue*, std::atomic<bool>*>(), 
              py::arg("action_limit"), py::arg("sample_queue"), py::arg("inference_queue"), py::arg("stop_flag"))
-        // ИСПРАВЛЕНИЕ 2: Имя метода изменено с "run_traversal" на "run_traversal_loop"
         .def("run_traversal_loop", &ofc::DeepMCCFR::run_traversal_loop, py::call_guard<py::gil_scoped_release>());
 }
