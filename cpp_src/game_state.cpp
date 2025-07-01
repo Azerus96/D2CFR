@@ -22,7 +22,6 @@ namespace ofc {
             board.bottom.fill(INVALID_CARD);
         }
         
-        // ИЗМЕНЕНО: Используем временный RNG только для сброса
         std::mt19937 temp_rng(std::random_device{}());
         deck_.resize(52);
         std::iota(deck_.begin(), deck_.end(), 0);
@@ -56,23 +55,29 @@ namespace ofc {
         if (p2_foul) return {(float)(SCOOP_BONUS + p1_royalty), -(float)(SCOOP_BONUS + p1_royalty)};
 
         int line_score = 0;
-        CardSet p1_top = p1_board.get_row_cards("top");
-        CardSet p1_mid = p1_board.get_row_cards("middle");
-        CardSet p1_bot = p1_board.get_row_cards("bottom");
-        CardSet p2_top = p2_board.get_row_cards("top");
-        CardSet p2_mid = p2_board.get_row_cards("middle");
-        CardSet p2_bot = p2_board.get_row_cards("bottom");
+        
+        auto compare_lines = [&](const CardSet& p1_cards, const CardSet& p2_cards) {
+            HandRank p1_rank = evaluator.evaluate(p1_cards);
+            HandRank p2_rank = evaluator.evaluate(p2_cards);
+            if (p1_rank < p2_rank) {
+                line_score++;
+            } else if (p2_rank < p1_rank) {
+                line_score--;
+            }
+        };
 
-        if (evaluator.evaluate(p1_top) < evaluator.evaluate(p2_top)) line_score++; else line_score--;
-        if (evaluator.evaluate(p1_mid) < evaluator.evaluate(p2_mid)) line_score++; else line_score--;
-        if (evaluator.evaluate(p1_bot) < evaluator.evaluate(p2_bot)) line_score++; else line_score--;
+        compare_lines(p1_board.get_row_cards("top"), p2_board.get_row_cards("top"));
+        compare_lines(p1_board.get_row_cards("middle"), p2_board.get_row_cards("middle"));
+        compare_lines(p1_board.get_row_cards("bottom"), p2_board.get_row_cards("bottom"));
 
-        if (abs(line_score) == 3) line_score = (line_score > 0) ? SCOOP_BONUS : -SCOOP_BONUS;
+        if (abs(line_score) == 3) {
+            line_score = (line_score > 0) ? SCOOP_BONUS : -SCOOP_BONUS;
+        }
+        
         float p1_total = (float)(line_score + p1_royalty - p2_royalty);
         return {p1_total, -p1_total};
     }
 
-    // ИЗМЕНЕНО: Принимает и использует RNG
     void GameState::get_legal_actions(size_t action_limit, std::vector<Action>& out_actions, std::mt19937& rng) const {
         out_actions.clear();
         if (is_terminal()) return;
@@ -174,7 +179,6 @@ namespace ofc {
         deck_.resize(deck_.size() - num_to_deal);
     }
 
-    // ИЗМЕНЕНО: Принимает и использует RNG
     void GameState::generate_random_placements(const CardSet& cards, Card discarded, std::vector<Action>& actions, size_t limit, std::mt19937& rng) const {
         const Board& board = boards_[current_player_];
         std::vector<std::pair<std::string, int>> available_slots;
