@@ -23,7 +23,7 @@ os.environ['NUMEXPR_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 torch.set_num_threads(int(NUM_COMPUTATION_THREADS))
 
 from .model import DuelingNetwork
-from ofc_engine import DeepMCCFR, SharedReplayBuffer, InferenceQueue, SampleQueue
+from ofc_engine import DeepMCCFR, SharedReplayBuffer, InferenceQueue, SampleQueue, AtomicBool
 
 # --- ГИПЕРПАРАМЕТРЫ ---
 INPUT_SIZE = 1486 
@@ -112,24 +112,16 @@ class ReplayBufferWriter(threading.Thread):
     def run(self):
         print(f"ReplayBufferWriter (ThreadID: {threading.get_ident()}) started.", flush=True)
         while not self.stop_event.is_set():
-            try:
-                # pop теперь блокирующий, поэтому дополнительный sleep не нужен
-                batch = self.sample_queue.pop()
-                if batch is not None:
-                    self.replay_buffer.push_batch(batch)
-                else:
-                    # Если pop вернул None, это может быть сигнал остановки
-                    if self.stop_event.is_set():
-                        break
-            except Exception as e:
-                if not self.stop_event.is_set():
-                    print(f"Error in ReplayBufferWriter: {e}", flush=True)
-                    traceback.print_exc()
+            batch = self.sample_queue.pop()
+            if batch is not None:
+                self.replay_buffer.push_batch(batch)
+            else:
+                if self.stop_event.is_set(): break
+                time.sleep(0.001) 
         print(f"ReplayBufferWriter (ThreadID: {threading.get_ident()}) stopped.", flush=True)
 
     def stop(self):
         self.stop_event.set()
-        # У concurrentqueue нет метода stop, завершение управляется извне
 
 def push_to_github(model_path, commit_message):
     try:
@@ -171,17 +163,15 @@ def main():
         worker.start()
     replay_buffer_writer.start()
 
-    solvers = [DeepMCCFR(ACTION_LIMIT, sample_queue, inference_queue) for _ in range(NUM_CPP_WORKERS)]
+    stop_flag = AtomicBool(False)
+    solvers = [DeepMCCFR(ACTION_LIMIT, sample_queue, inference_queue, stop_flag) for _ in range(NUM_CPP_WORKERS)]
     
-    stop_event = threading.Event()
-    total_samples_generated = 0
     git_thread = None
 
     try:
         with ThreadPoolExecutor(max_workers=NUM_CPP_WORKERS) as executor:
             def worker_loop(solver):
-                while not stop_event.is_set():
-                    solver.run_traversal()
+                solver.run_traversal_loop()
 
             print(f"Submitting {NUM_CPP_WORKERS} long-running C++ worker tasks...", flush=True)
             futures = {executor.submit(worker_loop, s) for s in solvers}
@@ -247,7 +237,7 @@ def main():
         print("\nTraining interrupted by user.", flush=True)
     finally:
         print("Stopping workers...")
-        stop_event.set()
+        stop_flag.store(True)
         
         model_provider.stop_event.set()
         inference_queue.stop()
