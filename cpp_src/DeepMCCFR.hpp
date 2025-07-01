@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <atomic>
 
 namespace ofc {
 
@@ -18,11 +19,10 @@ struct LocalSample {
 
 class DeepMCCFR {
 public:
-    // Конструктор принимает указатель на новую очередь для сэмплов
-    DeepMCCFR(size_t action_limit, SampleQueue* sample_queue, InferenceQueue* inference_queue);
+    DeepMCCFR(size_t action_limit, SampleQueue* sample_queue, InferenceQueue* inference_queue, std::atomic<bool>* stop_flag);
     ~DeepMCCFR(); 
     
-    void run_traversal();
+    void run_traversal_loop();
 
 private:
     void flush_local_buffer(); 
@@ -30,6 +30,7 @@ private:
     HandEvaluator evaluator_;
     SampleQueue* sample_queue_;
     InferenceQueue* inference_queue_;
+    std::atomic<bool>* stop_flag_;
     size_t action_limit_;
     std::mt19937 rng_;
 
