@@ -7,28 +7,39 @@
 
 namespace ofc {
 
-DeepMCCFR::DeepMCCFR(size_t action_limit, SharedReplayBuffer* buffer, InferenceQueue* queue) 
-    : action_limit_(action_limit), replay_buffer_(buffer), inference_queue_(queue), rng_(std::random_device{}()) {
-    // Инициализируем локальный буфер с预留空间 для эффективности
+// Конструктор теперь принимает указатели на SampleQueue и InferenceQueue
+DeepMCCFR::DeepMCCFR(size_t action_limit, SampleQueue* sample_queue, InferenceQueue* inference_queue) 
+    : action_limit_(action_limit), sample_queue_(sample_queue), inference_queue_(inference_queue), rng_(std::random_device{}()) {
     local_buffer_.reserve(LOCAL_BUFFER_CAPACITY);
 }
 
-// --- НОВОЕ: Деструктор, который гарантирует, что все данные будут сохранены при остановке ---
+// Деструктор сбрасывает остатки из локального буфера при завершении потока
 DeepMCCFR::~DeepMCCFR() {
     if (!local_buffer_.empty()) {
         flush_local_buffer();
     }
 }
 
-// --- НОВОЕ: Функция сброса локального буфера в глобальный ---
+// "Упаковывает" накопленные сэмплы и отправляет их в SampleQueue
 void DeepMCCFR::flush_local_buffer() {
-    // Этот метод вызывается редко, поэтому блокировка здесь не страшна
-    for (const auto& sample : local_buffer_) {
-        replay_buffer_->push(sample.infoset_vector, sample.regrets_vector, sample.num_actions);
+    if (local_buffer_.empty()) return;
+
+    SampleBatch batch;
+    batch.infosets.reserve(local_buffer_.size());
+    batch.regrets.reserve(local_buffer_.size());
+    batch.num_actions.reserve(local_buffer_.size());
+
+    for (auto& sample : local_buffer_) {
+        batch.infosets.push_back(std::move(sample.infoset_vector));
+        batch.regrets.push_back(std::move(sample.regrets_vector));
+        batch.num_actions.push_back(sample.num_actions);
     }
+    
+    sample_queue_->push(std::move(batch));
     local_buffer_.clear();
 }
 
+// Главная точка входа для одного цикла работы воркера
 void DeepMCCFR::run_traversal() {
     GameState state; 
     traverse(state, 0);
@@ -36,6 +47,7 @@ void DeepMCCFR::run_traversal() {
     traverse(state, 1);
 }
 
+// Функция преобразования состояния игры в вектор признаков (инфосет)
 std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view) {
     const Board& my_board = state.get_player_board(player_view);
     const Board& opp_board = state.get_opponent_board(player_view);
@@ -77,6 +89,7 @@ std::vector<float> DeepMCCFR::featurize(const GameState& state, int player_view)
     return features;
 }
 
+// Рекурсивная функция обхода дерева игры
 std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player) {
     if (state.is_terminal()) {
         auto payoffs = state.get_payoffs(evaluator_);
@@ -114,7 +127,7 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         std::future<std::vector<float>> future = promise.get_future();
 
         InferenceRequest request;
-        request.infoset = infoset_vec;
+        request.infoset = infoset_vec; // Копируем, т.к. infoset_vec понадобится ниже
         request.promise = std::move(promise);
         request.num_actions = num_actions;
         inference_queue_->push(std::move(request));
@@ -153,12 +166,11 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         true_regrets[i] = action_utils[i][current_player] - node_util[current_player];
     }
     
-    // --- ИЗМЕНЕНИЕ: Сохраняем в локальный буфер ---
-    local_buffer_.push_back({infoset_vec, true_regrets, num_actions});
+    // Сохраняем сэмпл в локальный буфер, а не в глобальный
+    local_buffer_.push_back({std::move(infoset_vec), std::move(true_regrets), num_actions});
     if (local_buffer_.size() >= LOCAL_BUFFER_CAPACITY) {
         flush_local_buffer();
     }
-    // ---------------------------------------------
 
     return node_util;
 }
