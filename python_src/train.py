@@ -11,11 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 import subprocess
 
 # --- НАСТРОЙКИ ---
-# Оставляем несколько ядер для Python и ОС, чтобы избежать "драки" за ресурсы
 NUM_CPP_WORKERS = int(os.cpu_count() or 96) - 8 
-# Количество потоков для вычислений PyTorch
 NUM_COMPUTATION_THREADS = "8"
-# --- НОВОЕ: Количество потоков для инференса, должно совпадать с NUM_COMPUTATION_THREADS ---
 NUM_INFERENCE_WORKERS = 8 
 
 os.environ['OMP_NUM_THREADS'] = NUM_COMPUTATION_THREADS
@@ -32,14 +29,14 @@ from ofc_engine import DeepMCCFR, SharedReplayBuffer, InferenceQueue
 INPUT_SIZE = 1486 
 ACTION_LIMIT = 100
 LEARNING_RATE = 0.001
-REPLAY_BUFFER_CAPACITY = 5_000_000 # Увеличим буфер для более стабильного обучения
-BATCH_SIZE = 8192 # Увеличим батч для обучения, чтобы лучше утилизировать CPU
+REPLAY_BUFFER_CAPACITY = 5_000_000
+BATCH_SIZE = 8192
 SAVE_INTERVAL_SECONDS = 1800
 MODEL_PATH = "d2cfr_model.pth"
 
 # Параметры для пакетного инференса
-INFERENCE_BATCH_SIZE = 1024 # Оптимальный размер батча для пула воркеров
-INFERENCE_MAX_DELAY_MS = 1 # Минимальная задержка для отзывчивости
+INFERENCE_BATCH_SIZE = 1024
+INFERENCE_MAX_DELAY_MS = 1
 
 class InferenceWorker(threading.Thread):
     def __init__(self, model_provider, queue, device, worker_id):
@@ -61,8 +58,9 @@ class InferenceWorker(threading.Thread):
                     self.model_provider.mark_updated(self.worker_id)
                     print(f"InferenceWorker-{self.worker_id} updated model.", flush=True)
 
-                self.queue.wait() 
-                requests = self.queue.pop_all()
+                # --- ИЗМЕНЕНИЕ: Каждый воркер берет себе порцию работы ---
+                # Метод pop_n теперь блокирующий, он будет ждать, если очередь пуста.
+                requests = self.queue.pop_n(INFERENCE_BATCH_SIZE)
                 
                 if not requests:
                     continue
@@ -70,8 +68,10 @@ class InferenceWorker(threading.Thread):
                 self.process_batch(requests, model)
 
             except Exception as e:
-                print(f"Error in InferenceWorker-{self.worker_id}: {e}", flush=True)
-                traceback.print_exc()
+                # Исключаем ошибку, возникающую при завершении работы
+                if not self.stop_event.is_set():
+                    print(f"Error in InferenceWorker-{self.worker_id}: {e}", flush=True)
+                    traceback.print_exc()
 
         print(f"InferenceWorker-{self.worker_id} (ThreadID: {threading.get_ident()}) stopped.", flush=True)
 
@@ -234,6 +234,13 @@ def main():
         for worker in inference_workers:
             worker.stop()
         
+        # Чтобы разбудить заблокированные потоки, нужно добавить фиктивный элемент в очередь
+        # Это нужно сделать для каждого инференс-воркера
+        for _ in range(NUM_INFERENCE_WORKERS):
+            dummy_promise =_ = std.promise<std::vector<float>>()
+            dummy_request = InferenceRequest{infoset=[], promise=std::move(dummy_promise), num_actions=0}
+            inference_queue.push(std::move(dummy_request))
+
         # Ждем завершения C++ воркеров
         for future in futures:
             try:
