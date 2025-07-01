@@ -32,13 +32,15 @@ PYBIND11_MODULE(ofc_engine, m) {
 
     py::class_<ofc::SampleQueue>(m, "SampleQueue")
         .def(py::init<>())
-        .def("pop", [](ofc::SampleQueue& q) {
+        // --- ИЗМЕНЕНИЕ: Явно указываем тип возвращаемого значения лямбды ---
+        .def("pop", [](ofc::SampleQueue& q) -> py::object { // <-- Указываем, что возвращаем py::object
             ofc::SampleBatch batch;
             if (q.pop(batch)) {
                 return py::cast(batch);
             }
-            return py::none();
+            return py::none(); // py::none() автоматически приводится к py::object
         }, py::call_guard<py::gil_scoped_release>());
+    // --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     py::class_<ofc::SharedReplayBuffer>(m, "SharedReplayBuffer")
         .def(py::init<uint64_t, int>(), py::arg("capacity"), py::arg("action_limit"))
