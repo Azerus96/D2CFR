@@ -13,10 +13,9 @@ PYBIND11_MODULE(ofc_engine, m) {
 
     py::class_<InferenceQueue>(m, "InferenceQueue")
         .def(py::init<>())
-        // --- ИЗМЕНЕНИЕ: Биндим новый метод pop_n и удаляем старые ---
-        // Python будет вызывать именно этот метод.
-        // GIL освобождается на время ожидания, позволяя другим Python-потокам работать.
-        .def("pop_n", &InferenceQueue::pop_n, py::arg("n"), py::call_guard<py::gil_scoped_release>());
+        .def("pop_n", &InferenceQueue::pop_n, py::arg("n"), py::call_guard<py::gil_scoped_release>())
+        // --- ДОБАВЛЕНО: Биндим новый метод stop ---
+        .def("stop", &InferenceQueue::stop);
 
     py::class_<InferenceRequest>(m, "InferenceRequest")
         .def_readonly("infoset", &InferenceRequest::infoset)
