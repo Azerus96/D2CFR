@@ -112,15 +112,24 @@ class ReplayBufferWriter(threading.Thread):
     def run(self):
         print(f"ReplayBufferWriter (ThreadID: {threading.get_ident()}) started.", flush=True)
         while not self.stop_event.is_set():
-            batch = self.sample_queue.pop()
-            if batch is not None:
-                self.replay_buffer.push_batch(batch)
-            else:
-                time.sleep(0.001) 
+            try:
+                # pop теперь блокирующий, поэтому дополнительный sleep не нужен
+                batch = self.sample_queue.pop()
+                if batch is not None:
+                    self.replay_buffer.push_batch(batch)
+                else:
+                    # Если pop вернул None, это может быть сигнал остановки
+                    if self.stop_event.is_set():
+                        break
+            except Exception as e:
+                if not self.stop_event.is_set():
+                    print(f"Error in ReplayBufferWriter: {e}", flush=True)
+                    traceback.print_exc()
         print(f"ReplayBufferWriter (ThreadID: {threading.get_ident()}) stopped.", flush=True)
 
     def stop(self):
         self.stop_event.set()
+        # У concurrentqueue нет метода stop, завершение управляется извне
 
 def push_to_github(model_path, commit_message):
     try:
