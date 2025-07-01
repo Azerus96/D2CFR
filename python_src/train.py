@@ -34,9 +34,7 @@ BATCH_SIZE = 8192
 SAVE_INTERVAL_SECONDS = 1800
 MODEL_PATH = "d2cfr_model.pth"
 
-# Параметры для пакетного инференса
 INFERENCE_BATCH_SIZE = 1024
-INFERENCE_MAX_DELAY_MS = 1
 
 class InferenceWorker(threading.Thread):
     def __init__(self, model_provider, queue, device, worker_id):
@@ -45,7 +43,8 @@ class InferenceWorker(threading.Thread):
         self.queue = queue
         self.device = device
         self.worker_id = worker_id
-        self.stop_event = threading.Event()
+        # --- ИЗМЕНЕНИЕ: Используем общий stop_event из model_provider ---
+        self.stop_event = self.model_provider.stop_event
 
     def run(self):
         print(f"InferenceWorker-{self.worker_id} (ThreadID: {threading.get_ident()}) started.", flush=True)
@@ -56,19 +55,18 @@ class InferenceWorker(threading.Thread):
                 if self.model_provider.is_updated(self.worker_id):
                     model = self.model_provider.get_model()
                     self.model_provider.mark_updated(self.worker_id)
-                    print(f"InferenceWorker-{self.worker_id} updated model.", flush=True)
-
-                # --- ИЗМЕНЕНИЕ: Каждый воркер берет себе порцию работы ---
-                # Метод pop_n теперь блокирующий, он будет ждать, если очередь пуста.
+                
                 requests = self.queue.pop_n(INFERENCE_BATCH_SIZE)
                 
                 if not requests:
+                    # Если pop_n вернул пустой вектор, это может быть сигнал остановки
+                    if self.stop_event.is_set():
+                        break
                     continue
                 
                 self.process_batch(requests, model)
 
             except Exception as e:
-                # Исключаем ошибку, возникающую при завершении работы
                 if not self.stop_event.is_set():
                     print(f"Error in InferenceWorker-{self.worker_id}: {e}", flush=True)
                     traceback.print_exc()
@@ -88,15 +86,13 @@ class InferenceWorker(threading.Thread):
             result = results_list[i][:req.num_actions].tolist()
             req.set_result(result)
 
-    def stop(self):
-        self.stop_event.set()
-
 class InferenceModelProvider:
     def __init__(self, model, device, num_workers):
         self.device = device
         self.num_workers = num_workers
         self.model_lock = threading.Lock()
         self.updated_flags = [True] * num_workers
+        self.stop_event = threading.Event() # <-- Общий флаг остановки
         self.set_model(model)
 
     def set_model(self, model):
@@ -231,24 +227,19 @@ def main():
     finally:
         print("Stopping workers...")
         stop_event.set()
-        for worker in inference_workers:
-            worker.stop()
         
-        # Чтобы разбудить заблокированные потоки, нужно добавить фиктивный элемент в очередь
-        # Это нужно сделать для каждого инференс-воркера
-        for _ in range(NUM_INFERENCE_WORKERS):
-            dummy_promise =_ = std.promise<std::vector<float>>()
-            dummy_request = InferenceRequest{infoset=[], promise=std::move(dummy_promise), num_actions=0}
-            inference_queue.push(std::move(dummy_request))
-
-        # Ждем завершения C++ воркеров
+        # --- ИЗМЕНЕНИЕ: Правильная и надежная остановка ---
+        model_provider.stop_event.set()
+        inference_queue.stop() # Это разбудит все инференс-воркеры
+        
+        print("Waiting for C++ workers to finish...")
         for future in futures:
             try:
                 future.result(timeout=5)
             except Exception as e:
                 print(f"C++ worker finished with an exception: {e}")
 
-        # Ждем завершения инференс-воркеров
+        print("Waiting for inference workers to finish...")
         for worker in inference_workers:
             worker.join(timeout=5)
 
