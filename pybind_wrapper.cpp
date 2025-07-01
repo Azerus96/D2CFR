@@ -4,7 +4,7 @@
 #include "cpp_src/DeepMCCFR.hpp"
 #include "cpp_src/SharedReplayBuffer.hpp"
 #include "cpp_src/InferenceQueue.hpp"
-#include "cpp_src/constants.hpp" // <-- ДОБАВЛЕНО
+#include "cpp_src/constants.hpp"
 
 namespace py = pybind11;
 
@@ -13,8 +13,10 @@ PYBIND11_MODULE(ofc_engine, m) {
 
     py::class_<InferenceQueue>(m, "InferenceQueue")
         .def(py::init<>())
-        .def("pop_all", &InferenceQueue::pop_all)
-        .def("wait", &InferenceQueue::wait, py::call_guard<py::gil_scoped_release>());
+        // --- ИЗМЕНЕНИЕ: Биндим новый метод pop_n и удаляем старые ---
+        // Python будет вызывать именно этот метод.
+        // GIL освобождается на время ожидания, позволяя другим Python-потокам работать.
+        .def("pop_n", &InferenceQueue::pop_n, py::arg("n"), py::call_guard<py::gil_scoped_release>());
 
     py::class_<InferenceRequest>(m, "InferenceRequest")
         .def_readonly("infoset", &InferenceRequest::infoset)
