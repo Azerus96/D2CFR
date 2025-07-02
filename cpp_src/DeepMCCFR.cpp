@@ -62,7 +62,6 @@ void DeepMCCFR::process_responses() {
         ParkedTraversal parked = std::move(it->second);
         parked_traversals_.erase(it);
 
-        // --- ВОЗОБНОВЛЯЕМ СИМУЛЯЦИЮ ---
         GameState state = std::move(parked.state);
         int traversing_player = parked.traversing_player;
         int current_player = state.get_current_player();
@@ -87,13 +86,12 @@ void DeepMCCFR::process_responses() {
 
         std::vector<std::map<int, float>> action_utils(num_actions);
         std::map<int, float> node_util = {{0, 0.0f}, {1, 0.0f}};
-        UndoInfo undo_info;
-
+        
         for (int i = 0; i < num_actions; ++i) {
-            GameState next_state = state; // Копируем состояние для каждой ветки
+            GameState next_state = state;
+            UndoInfo undo_info;
             next_state.apply_action(legal_actions[i], traversing_player, undo_info);
             action_utils[i] = traverse(next_state, traversing_player);
-            // undo не нужен, т.к. мы работаем с копией
             for(auto const& [player_idx, util] : action_utils[i]) {
                 node_util[player_idx] += strategy[i] * util;
             }
@@ -104,7 +102,6 @@ void DeepMCCFR::process_responses() {
             true_regrets[i] = action_utils[i][current_player] - node_util[current_player];
         }
         
-        // Инфосет был в исходном состоянии, которое мы сохранили
         std::vector<float> infoset_vec = featurize(state, current_player);
         local_buffer_.push_back({std::move(infoset_vec), std::move(true_regrets), num_actions});
         if (local_buffer_.size() >= LOCAL_BUFFER_CAPACITY) {
@@ -123,7 +120,8 @@ void DeepMCCFR::start_new_traversals() {
 
 std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player) {
     if (state.is_terminal()) {
-        return state.get_payoffs(evaluator_);
+        auto payoffs_pair = state.get_payoffs(evaluator_);
+        return {{0, payoffs_pair.first}, {1, payoffs_pair.second}};
     }
 
     int current_player = state.get_current_player();
@@ -147,15 +145,12 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
         return result;
     }
 
-    // --- АСИНХРОННАЯ ЛОГИКА ---
     RequestId req_id = (static_cast<uint64_t>(worker_id_) << 48) | next_request_id_.fetch_add(1);
     std::vector<float> infoset_vec = featurize(state, current_player);
     
     request_queue_->push({req_id, infoset_vec, num_actions});
     parked_traversals_[req_id] = {std::move(state), traversing_player};
     
-    // Возвращаем пустой результат, т.к. этот путь будет обработан асинхронно
-    // Но этот результат не будет использован, т.к. мы вышли из рекурсии
     return {};
 }
 
