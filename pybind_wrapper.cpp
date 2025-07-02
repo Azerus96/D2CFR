@@ -12,28 +12,35 @@
 namespace py = pybind11;
 
 PYBIND11_MODULE(ofc_engine, m) {
-    m.doc() = "OFC Engine with Lock-Free Queues";
+    m.doc() = "OFC Engine with Asynchronous Traversal";
 
     py::class_<std::atomic<bool>>(m, "AtomicBool")
         .def(py::init<bool>())
-        .def("load", [](const std::atomic<bool> &a) {
-            return a.load();
-        })
-        .def("store", [](std::atomic<bool> &a, bool val) {
-            a.store(val);
-        });
+        .def("load", [](const std::atomic<bool> &a) { return a.load(); })
+        .def("store", [](std::atomic<bool> &a, bool val) { a.store(val); });
 
-    py::class_<InferenceQueue>(m, "InferenceQueue")
-        .def(py::init<>())
-        .def("pop_n", &InferenceQueue::pop_n, py::arg("n"), py::call_guard<py::gil_scoped_release>())
-        .def("stop", &InferenceQueue::stop);
-
+    // --- НОВЫЕ ОБЕРТКИ ДЛЯ ОЧЕРЕДЕЙ ---
     py::class_<InferenceRequest>(m, "InferenceRequest")
+        .def_readonly("id", &InferenceRequest::id)
         .def_readonly("infoset", &InferenceRequest::infoset)
-        .def_readonly("num_actions", &InferenceRequest::num_actions)
-        .def("set_result", [](InferenceRequest &req, std::vector<float> result) {
-            req.promise.set_value(result);
-        });
+        .def_readonly("num_actions", &InferenceRequest::num_actions);
+
+    py::class_<InferenceResponse>(m, "InferenceResponse")
+        .def(py::init<RequestId, std::vector<float>>(), py::arg("id"), py::arg("regrets"));
+
+    py::class_<InferenceRequestQueue>(m, "InferenceRequestQueue")
+        .def(py::init<>())
+        .def("pop_n", [](InferenceRequestQueue& q, size_t n) {
+            std::vector<InferenceRequest> reqs;
+            reqs.reserve(n);
+            q.pop_n(reqs, n);
+            return reqs;
+        }, py::arg("n"), py::call_guard<py::gil_scoped_release>());
+
+    py::class_<InferenceResponseQueue>(m, "InferenceResponseQueue")
+        .def(py::init<>())
+        .def("push", &InferenceResponseQueue::push, py::call_guard<py::gil_scoped_release>());
+    // --- КОНЕЦ НОВЫХ ОБЕРТОК ---
 
     py::class_<ofc::SampleBatch>(m, "SampleBatch")
         .def(py::init<>())
@@ -50,12 +57,9 @@ PYBIND11_MODULE(ofc_engine, m) {
                 py::gil_scoped_release release;
                 success = q.pop(batch);
             }
-            if (success) {
-                return py::cast(batch);
-            }
+            if (success) { return py::cast(batch); }
             return py::none();
         })
-        // ИЗМЕНЕНИЕ: Добавляем метод stop в Python-обертку
         .def("stop", &ofc::SampleQueue::stop);
 
     py::class_<ofc::SharedReplayBuffer>(m, "SharedReplayBuffer")
@@ -71,18 +75,14 @@ PYBIND11_MODULE(ofc_engine, m) {
             int action_limit = buffer.get_max_actions();
             auto infosets_np = py::array_t<float>(batch_size * ofc::INFOSET_SIZE);
             auto regrets_np = py::array_t<float>(batch_size * action_limit);
-            buffer.sample(
-                batch_size, 
-                static_cast<float*>(infosets_np.request().ptr), 
-                static_cast<float*>(regrets_np.request().ptr)
-            );
+            buffer.sample(batch_size, static_cast<float*>(infosets_np.request().ptr), static_cast<float*>(regrets_np.request().ptr));
             infosets_np.resize({batch_size, ofc::INFOSET_SIZE});
             regrets_np.resize({batch_size, action_limit});
             return std::make_pair(infosets_np, regrets_np);
         }, py::arg("batch_size"));
 
     py::class_<ofc::DeepMCCFR>(m, "DeepMCCFR")
-        .def(py::init<size_t, ofc::SampleQueue*, InferenceQueue*, std::atomic<bool>*>(), 
-             py::arg("action_limit"), py::arg("sample_queue"), py::arg("inference_queue"), py::arg("stop_flag"))
-        .def("run_traversal_loop", &ofc::DeepMCCFR::run_traversal_loop, py::call_guard<py::gil_scoped_release>());
+        .def(py::init<size_t, ofc::SampleQueue*, InferenceRequestQueue*, InferenceResponseQueue*, std::atomic<bool>*, int>(), 
+             py::arg("action_limit"), py::arg("sample_queue"), py::arg("request_queue"), py::arg("response_queue"), py::arg("stop_flag"), py::arg("worker_id"))
+        .def("run_main_loop", &ofc::DeepMCCFR::run_main_loop, py::call_guard<py::gil_scoped_release>());
 }
