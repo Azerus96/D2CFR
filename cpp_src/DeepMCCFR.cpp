@@ -85,7 +85,6 @@ void DeepMCCFR::process_responses() {
             std::fill(strategy.begin(), strategy.end(), 1.0f / num_actions);
         }
 
-        // Заменяем состояние в варианте на новое, конструируя его "на месте"
         it->second.emplace<WaitingForChildren>(
             state,
             traversing_player,
@@ -121,29 +120,31 @@ void DeepMCCFR::on_child_util_ready(RequestId parent_id, int action_index, const
     parent_state_ptr->child_utils[action_index] = util;
     
     if (parent_state_ptr->children_remaining.fetch_sub(1) == 1) {
-        // Копируем данные, которые нам нужны, НЕ перемещаем всю структуру
+        // --- ИСПРАВЛЕНИЕ: Сначала копируем все данные, потом удаляем ---
         Continuation on_complete = std::move(parent_state_ptr->on_complete);
         int current_player = parent_state_ptr->current_player;
         int num_actions = parent_state_ptr->legal_actions.size();
+        std::vector<Utility> child_utils = parent_state_ptr->child_utils;
+        std::vector<float> strategy = parent_state_ptr->strategy;
+        GameState state = parent_state_ptr->state;
         
+        parked_traversals_.erase(it);
+        // --- Теперь используем только локальные копии ---
+
         Utility node_util = {{0, 0.0f}, {1, 0.0f}};
         for(int i = 0; i < num_actions; ++i) {
-            for(auto const& [player_idx, u] : parent_state_ptr->child_utils[i]) {
-                node_util[player_idx] += parent_state_ptr->strategy[i] * u;
+            for(auto const& [player_idx, u] : child_utils[i]) {
+                node_util[player_idx] += strategy[i] * u;
             }
         }
 
         std::vector<float> true_regrets(num_actions);
         for(int i = 0; i < num_actions; ++i) {
-            true_regrets[i] = parent_state_ptr->child_utils[i][current_player] - node_util[current_player];
+            true_regrets[i] = child_utils[i][current_player] - node_util[current_player];
         }
         
-        std::vector<float> infoset_vec = featurize(parent_state_ptr->state, current_player);
+        std::vector<float> infoset_vec = featurize(state, current_player);
         
-        // Удаляем из карты ПОСЛЕ того, как мы закончили использовать указатель
-        parked_traversals_.erase(it);
-
-        // Используем скопированные данные
         local_buffer_.push_back({std::move(infoset_vec), std::move(true_regrets), num_actions});
         if (local_buffer_.size() >= LOCAL_BUFFER_CAPACITY) {
             flush_local_buffer();
@@ -194,7 +195,8 @@ void DeepMCCFR::traverse(GameState& state, int traversing_player, Continuation o
     RequestId req_id = (static_cast<uint64_t>(worker_id_) << 48) | next_request_id_.fetch_add(1);
     std::vector<float> infoset_vec = featurize(state, current_player);
     
-    parked_traversals_.emplace(req_id, std::in_place_type<WaitingForNetwork>, state, traversing_player, std::move(on_complete));
+    // --- ИСПРАВЛЕНИЕ: Используем operator[] и прямую инициализацию ---
+    parked_traversals_[req_id] = WaitingForNetwork{state, traversing_player, std::move(on_complete)};
     
     request_queue_->push({req_id, std::move(infoset_vec), num_actions});
 }
