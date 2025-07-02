@@ -19,7 +19,6 @@ PYBIND11_MODULE(ofc_engine, m) {
         .def("load", [](const std::atomic<bool> &a) { return a.load(); })
         .def("store", [](std::atomic<bool> &a, bool val) { a.store(val); });
 
-    // --- НОВЫЕ ОБЕРТКИ ДЛЯ ОЧЕРЕДЕЙ ---
     py::class_<InferenceRequest>(m, "InferenceRequest")
         .def_readonly("id", &InferenceRequest::id)
         .def_readonly("infoset", &InferenceRequest::infoset)
@@ -32,15 +31,20 @@ PYBIND11_MODULE(ofc_engine, m) {
         .def(py::init<>())
         .def("pop_n", [](InferenceRequestQueue& q, size_t n) {
             std::vector<InferenceRequest> reqs;
-            reqs.reserve(n);
-            q.pop_n(reqs, n);
+            // ВАЖНО: pybind11 не может автоматически преобразовать список в вектор для bulk-операций.
+            // Нужно создать вектор нужного размера и передать указатели.
+            reqs.resize(n);
+            size_t dequeued_count = q.pop_n(reqs, n);
+            reqs.resize(dequeued_count);
             return reqs;
         }, py::arg("n"), py::call_guard<py::gil_scoped_release>());
 
     py::class_<InferenceResponseQueue>(m, "InferenceResponseQueue")
         .def(py::init<>())
-        .def("push", &InferenceResponseQueue::push, py::call_guard<py::gil_scoped_release>());
-    // --- КОНЕЦ НОВЫХ ОБЕРТОК ---
+        // ИСПРАВЛЕНИЕ: Используем лямбду для правильной передачи rvalue-ссылки
+        .def("push", [](InferenceResponseQueue &q, InferenceResponse resp) {
+            q.push(std::move(resp));
+        }, py::call_guard<py::gil_scoped_release>());
 
     py::class_<ofc::SampleBatch>(m, "SampleBatch")
         .def(py::init<>())
