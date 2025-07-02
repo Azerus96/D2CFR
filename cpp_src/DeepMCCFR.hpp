@@ -10,6 +10,7 @@
 #include <atomic>
 #include <unordered_map>
 #include <variant>
+#include <optional>
 
 namespace ofc {
 
