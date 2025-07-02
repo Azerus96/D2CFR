@@ -11,11 +11,11 @@ from concurrent.futures import ThreadPoolExecutor
 import subprocess
 
 # --- НАСТРОЙКИ ---
-cpu_count = os.cpu_count() or 1
+cpu_count = os.cpu_count() or 88
 # Асинхронная модель менее чувствительна к количеству инференс-воркеров,
 # но давайте дадим ей достаточно.
-NUM_INFERENCE_WORKERS = 16
-NUM_CPP_WORKERS = max(1, cpu_count - NUM_INFERENCE_WORKERS - 2)
+NUM_INFERENCE_WORKERS = 8
+NUM_CPP_WORKERS = max(8, cpu_count - NUM_INFERENCE_WORKERS - 8)
 NUM_COMPUTATION_THREADS = str(NUM_INFERENCE_WORKERS)
 
 os.environ['OMP_NUM_THREADS'] = NUM_COMPUTATION_THREADS
@@ -35,10 +35,10 @@ INPUT_SIZE = 1486
 ACTION_LIMIT = 100
 LEARNING_RATE = 0.001
 REPLAY_BUFFER_CAPACITY = 5_000_000
-BATCH_SIZE = 8192
+BATCH_SIZE = 2048
 SAVE_INTERVAL_SECONDS = 1800
 MODEL_PATH = "d2cfr_model.pth"
-INFERENCE_BATCH_SIZE = 2048 # Можно увеличить, т.к. инференс теперь не блокирует
+INFERENCE_BATCH_SIZE = 1024 # Можно увеличить, т.к. инференс теперь не блокирует
 
 class InferenceWorker(threading.Thread):
     def __init__(self, model_provider, req_q, resp_q, device, worker_id):
