@@ -43,6 +43,32 @@ struct WaitingForChildren {
     std::vector<Utility> child_utils;
     std::atomic<int> children_remaining;
     Continuation on_complete; // Что делать, когда все дочерние узлы ответят
+
+    // Явный конструктор для корректной инициализации std::atomic
+    WaitingForChildren(
+        const GameState& s,
+        int tp,
+        int cp,
+        const std::vector<Action>& la,
+        const std::vector<float>& strat,
+        std::vector<Utility>&& cu,
+        int children_count,
+        Continuation&& oc
+    ) : state(s),
+        traversing_player(tp),
+        current_player(cp),
+        legal_actions(la),
+        strategy(strat),
+        child_utils(std::move(cu)),
+        children_remaining(children_count),
+        on_complete(std::move(oc))
+    {}
+
+    // Явно запрещаем копирование и перемещение из-за std::atomic
+    WaitingForChildren(const WaitingForChildren&) = delete;
+    WaitingForChildren& operator=(const WaitingForChildren&) = delete;
+    WaitingForChildren(WaitingForChildren&&) = delete;
+    WaitingForChildren& operator=(WaitingForChildren&&) = delete;
 };
 
 // Используем std::variant для хранения одного из двух состояний "парковки"
