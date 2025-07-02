@@ -11,14 +11,11 @@ from concurrent.futures import ThreadPoolExecutor
 import subprocess
 
 # --- НАСТРОЙКИ ---
-# Определяем количество воркеров. Оставляем 8 ядер для инференса, PyTorch и системы.
-# Если ядер меньше 9, используем 1 C++ воркер.
 cpu_count = os.cpu_count() or 1
 NUM_CPP_WORKERS = max(1, cpu_count - 8)
 NUM_COMPUTATION_THREADS = "8"
 NUM_INFERENCE_WORKERS = 8 
 
-# Установка переменных окружения для управления потоками в библиотеках
 os.environ['OMP_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['OPENBLAS_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['MKL_NUM_THREADS'] = NUM_COMPUTATION_THREADS
@@ -26,7 +23,6 @@ os.environ['VECLIB_MAXIMUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['NUMEXPR_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 torch.set_num_threads(int(NUM_COMPUTATION_THREADS))
 
-# Импортируем C++ модуль и модель
 from .model import DuelingNetwork
 from ofc_engine import DeepMCCFR, SharedReplayBuffer, InferenceQueue, SampleQueue, AtomicBool
 
@@ -36,15 +32,11 @@ ACTION_LIMIT = 100
 LEARNING_RATE = 0.001
 REPLAY_BUFFER_CAPACITY = 5_000_000
 BATCH_SIZE = 8192
-SAVE_INTERVAL_SECONDS = 1800  # 30 минут
+SAVE_INTERVAL_SECONDS = 1800
 MODEL_PATH = "d2cfr_model.pth"
 INFERENCE_BATCH_SIZE = 1024
 
 class InferenceWorker(threading.Thread):
-    """
-    Поток, который забирает запросы на инференс из очереди,
-    обрабатывает их батчами и возвращает результаты.
-    """
     def __init__(self, model_provider, queue, device, worker_id):
         super().__init__(daemon=True)
         self.model_provider = model_provider
@@ -59,17 +51,15 @@ class InferenceWorker(threading.Thread):
         
         while not self.stop_event.is_set():
             try:
-                # Проверяем, не обновилась ли модель
                 if self.model_provider.is_updated(self.worker_id):
                     self.model = self.model_provider.get_model()
                     self.model_provider.mark_updated(self.worker_id)
                 
-                # Забираем батч запросов
                 requests = self.queue.pop_n(INFERENCE_BATCH_SIZE)
                 
                 if not requests:
                     if self.stop_event.is_set(): break
-                    time.sleep(0.001) # Небольшая пауза, чтобы не грузить CPU
+                    time.sleep(0.001)
                     continue
                 
                 self.process_batch(requests)
@@ -86,16 +76,10 @@ class InferenceWorker(threading.Thread):
             results_tensor = self.model(tensor)
         results_list = results_tensor.cpu().numpy()
         for i, req in enumerate(requests):
-            # Отправляем результат обратно в C++ future
             result = results_list[i][:req.num_actions].tolist()
             req.set_result(result)
 
 class InferenceModelProvider:
-    """
-    Класс для безопасного доступа к модели из разных потоков.
-    Позволяет обновлять модель в главном потоке и сообщать
-    инференс-воркерам, что доступна новая версия.
-    """
     def __init__(self, model, device, num_workers):
         self.device = device
         self.num_workers = num_workers
@@ -106,10 +90,8 @@ class InferenceModelProvider:
 
     def set_model(self, model):
         with self.model_lock:
-            # Квантизация модели для ускорения инференса на CPU
             self.model = torch.quantization.quantize_dynamic(model.eval(), {torch.nn.Linear}, dtype=torch.qint8)
             self.updated_flags = [True] * self.num_workers
-        # print("New inference model is ready for all workers.", flush=True)
 
     def get_model(self):
         with self.model_lock:
@@ -122,10 +104,6 @@ class InferenceModelProvider:
         self.updated_flags[worker_id] = False
 
 class ReplayBufferWriter(threading.Thread):
-    """
-    Поток, который забирает сгенерированные сэмплы из SampleQueue
-    и складывает их в общий буфер воспроизведения.
-    """
     def __init__(self, sample_queue, replay_buffer):
         super().__init__(daemon=True)
         self.sample_queue = sample_queue
@@ -138,18 +116,15 @@ class ReplayBufferWriter(threading.Thread):
             batch = self.sample_queue.pop()
             if batch is not None:
                 self.replay_buffer.push_batch(batch)
-            else:
-                if self.stop_event.is_set(): break
-                time.sleep(0.001) 
+            elif self.stop_event.is_set():
+                break
         print(f"ReplayBufferWriter (ThreadID: {threading.get_ident()}) stopped.", flush=True)
 
     def stop(self):
         self.stop_event.set()
+        self.sample_queue.stop() # <-- ИЗМЕНЕНИЕ: Прерываем ожидание в C++ pop()
 
 def push_to_github(model_path, commit_message):
-    """
-    Функция для сохранения прогресса в Git.
-    """
     try:
         print("Pushing progress to GitHub...", flush=True)
         subprocess.run(['git', 'config', '--global', 'user.email', 'bot@example.com'], check=True, capture_output=True)
@@ -184,7 +159,6 @@ def main():
 
     model_provider = InferenceModelProvider(model, device, NUM_INFERENCE_WORKERS)
     
-    # --- ЗАПУСК ВСЕХ ВОРКЕРОВ СРАЗУ ---
     print("Starting Python workers (Inference, ReplayBufferWriter)...", flush=True)
     inference_workers = [InferenceWorker(model_provider, inference_queue, device, i) for i in range(NUM_INFERENCE_WORKERS)]
     replay_buffer_writer = ReplayBufferWriter(sample_queue, replay_buffer)
@@ -200,15 +174,12 @@ def main():
     executor = ThreadPoolExecutor(max_workers=NUM_CPP_WORKERS)
 
     try:
-        # Запускаем C++ воркеры в фоновом режиме
         print(f"Submitting {NUM_CPP_WORKERS} C++ worker tasks...", flush=True)
         for s in solvers:
             futures.add(executor.submit(s.run_traversal_loop))
         
-        # --- ФАЗА НАПОЛНЕНИЯ БУФЕРА (WARM-UP) ---
         print(f"Warm-up phase: waiting for Replay Buffer to contain at least {BATCH_SIZE} samples.", flush=True)
         while replay_buffer.get_count() < BATCH_SIZE:
-            # Проверяем, не упал ли какой-то воркер
             for future in list(futures):
                 if future.done() and future.exception():
                     print("\nFATAL: C++ worker failed during warm-up!", flush=True)
@@ -219,19 +190,16 @@ def main():
         
         print("\nWarm-up complete. Starting main training loop.", flush=True)
 
-        # --- ОСНОВНОЙ ЦИКЛ ОБУЧЕНИЯ ---
         last_save_time = time.time()
         last_report_time = time.time()
         total_samples_at_last_report = replay_buffer.get_count()
         training_steps = 0
 
         while True:
-            # Проверяем C++ воркеры на ошибки
             for future in list(futures):
                 if future.done() and future.exception():
                     raise future.exception()
 
-            # Обучение
             model.train()
             infosets_np, targets_np = replay_buffer.sample(BATCH_SIZE)
             
@@ -246,11 +214,9 @@ def main():
             optimizer.step()
             training_steps += 1
             
-            # Обновляем модель для инференса не слишком часто
             if training_steps % 10 == 0:
                 model_provider.set_model(model)
             
-            # Отчетность
             now = time.time()
             if now - last_report_time > 10.0:
                 current_buffer_size = replay_buffer.get_count()
@@ -266,7 +232,6 @@ def main():
                 total_samples_at_last_report = current_buffer_size
                 last_report_time = now
 
-            # Сохранение
             if now - last_save_time > SAVE_INTERVAL_SECONDS:
                 if git_thread and git_thread.is_alive():
                     print("Previous Git push is still running. Skipping this save.", flush=True)
@@ -291,11 +256,10 @@ def main():
         
         model_provider.stop_event.set()
         inference_queue.stop()
-        replay_buffer_writer.stop()
+        replay_buffer_writer.stop() # <-- Этот вызов теперь разбудит и C++ pop()
         
         if futures:
             print("Shutting down C++ worker pool...")
-            # Не ждем завершения, просто отменяем задачи
             executor.shutdown(wait=False, cancel_futures=True)
 
         print("Waiting for Python workers to finish...")
