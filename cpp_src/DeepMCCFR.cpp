@@ -149,7 +149,9 @@ std::map<int, float> DeepMCCFR::traverse(GameState& state, int traversing_player
     std::vector<float> infoset_vec = featurize(state, current_player);
     
     request_queue_->push({req_id, infoset_vec, num_actions});
-    parked_traversals_[req_id] = {std::move(state), traversing_player};
+    
+    // ИСПРАВЛЕНИЕ: Копируем 'state', а не перемещаем его.
+    parked_traversals_[req_id] = {state, traversing_player};
     
     return {};
 }
