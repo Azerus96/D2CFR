@@ -14,11 +14,8 @@ namespace py = pybind11;
 PYBIND11_MODULE(ofc_engine, m) {
     m.doc() = "OFC Engine with Lock-Free Queues";
 
-    // --- НОВЫЙ КЛАСС: Обёртка для std::atomic<bool> ---
     py::class_<std::atomic<bool>>(m, "AtomicBool")
-        .def(py::init<bool>()) // Конструктор, принимающий bool
-        
-        // ИСПРАВЛЕНИЕ: Используем лямбда-функции для вызова методов с аргументами по умолчанию
+        .def(py::init<bool>())
         .def("load", [](const std::atomic<bool> &a) {
             return a.load();
         })
@@ -57,7 +54,9 @@ PYBIND11_MODULE(ofc_engine, m) {
                 return py::cast(batch);
             }
             return py::none();
-        });
+        })
+        // ИЗМЕНЕНИЕ: Добавляем метод stop в Python-обертку
+        .def("stop", &ofc::SampleQueue::stop);
 
     py::class_<ofc::SharedReplayBuffer>(m, "SharedReplayBuffer")
         .def(py::init<uint64_t, int>(), py::arg("capacity"), py::arg("action_limit"))
