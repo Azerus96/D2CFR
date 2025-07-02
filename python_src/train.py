@@ -12,9 +12,11 @@ import subprocess
 
 # --- НАСТРОЙКИ ---
 cpu_count = os.cpu_count() or 1
-NUM_CPP_WORKERS = max(1, cpu_count - 8)
-NUM_COMPUTATION_THREADS = "8"
-NUM_INFERENCE_WORKERS = 8 
+# Асинхронная модель менее чувствительна к количеству инференс-воркеров,
+# но давайте дадим ей достаточно.
+NUM_INFERENCE_WORKERS = 16
+NUM_CPP_WORKERS = max(1, cpu_count - NUM_INFERENCE_WORKERS - 2)
+NUM_COMPUTATION_THREADS = str(NUM_INFERENCE_WORKERS)
 
 os.environ['OMP_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 os.environ['OPENBLAS_NUM_THREADS'] = NUM_COMPUTATION_THREADS
@@ -24,7 +26,9 @@ os.environ['NUMEXPR_NUM_THREADS'] = NUM_COMPUTATION_THREADS
 torch.set_num_threads(int(NUM_COMPUTATION_THREADS))
 
 from .model import DuelingNetwork
-from ofc_engine import DeepMCCFR, SharedReplayBuffer, InferenceQueue, SampleQueue, AtomicBool
+# ИЗМЕНЕНИЕ: Импортируем новые классы
+from ofc_engine import (DeepMCCFR, SharedReplayBuffer, SampleQueue, AtomicBool,
+                        InferenceRequestQueue, InferenceResponseQueue, InferenceResponse)
 
 # --- ГИПЕРПАРАМЕТРЫ ---
 INPUT_SIZE = 1486 
@@ -34,20 +38,22 @@ REPLAY_BUFFER_CAPACITY = 5_000_000
 BATCH_SIZE = 8192
 SAVE_INTERVAL_SECONDS = 1800
 MODEL_PATH = "d2cfr_model.pth"
-INFERENCE_BATCH_SIZE = 1024
+INFERENCE_BATCH_SIZE = 2048 # Можно увеличить, т.к. инференс теперь не блокирует
 
 class InferenceWorker(threading.Thread):
-    def __init__(self, model_provider, queue, device, worker_id):
+    def __init__(self, model_provider, req_q, resp_q, device, worker_id):
         super().__init__(daemon=True)
         self.model_provider = model_provider
-        self.queue = queue
+        self.req_q = req_q
+        self.resp_q = resp_q
         self.device = device
         self.worker_id = worker_id
-        self.stop_event = self.model_provider.stop_event
+        self.stop_event = threading.Event()
         self.model = None
 
     def run(self):
-        print(f"InferenceWorker-{self.worker_id} (ThreadID: {threading.get_ident()}) started.", flush=True)
+        print(f"InferenceWorker-{self.worker_id} started.", flush=True)
+        self.model = self.model_provider.get_model()
         
         while not self.stop_event.is_set():
             try:
@@ -55,10 +61,8 @@ class InferenceWorker(threading.Thread):
                     self.model = self.model_provider.get_model()
                     self.model_provider.mark_updated(self.worker_id)
                 
-                requests = self.queue.pop_n(INFERENCE_BATCH_SIZE)
-                
+                requests = self.req_q.pop_n(INFERENCE_BATCH_SIZE)
                 if not requests:
-                    if self.stop_event.is_set(): break
                     time.sleep(0.001)
                     continue
                 
@@ -67,18 +71,27 @@ class InferenceWorker(threading.Thread):
                 if not self.stop_event.is_set():
                     print(f"Error in InferenceWorker-{self.worker_id}: {e}", flush=True)
                     traceback.print_exc()
-        print(f"InferenceWorker-{self.worker_id} (ThreadID: {threading.get_ident()}) stopped.", flush=True)
+        print(f"InferenceWorker-{self.worker_id} stopped.", flush=True)
 
     def process_batch(self, requests):
+        ids = [req.id for req in requests]
         infosets = [req.infoset for req in requests]
+        num_actions = [req.num_actions for req in requests]
+
         tensor = torch.tensor(infosets, dtype=torch.float32).to(self.device)
         with torch.no_grad():
             results_tensor = self.model(tensor)
         results_list = results_tensor.cpu().numpy()
-        for i, req in enumerate(requests):
-            result = results_list[i][:req.num_actions].tolist()
-            req.set_result(result)
 
+        for i in range(len(requests)):
+            result = results_list[i][:num_actions[i]].tolist()
+            # Отправляем ответ с ID обратно в C++
+            self.resp_q.push(InferenceResponse(ids[i], result))
+
+    def stop(self):
+        self.stop_event.set()
+
+# ... (InferenceModelProvider и ReplayBufferWriter остаются такими же, как в предыдущей версии) ...
 class InferenceModelProvider:
     def __init__(self, model, device, num_workers):
         self.device = device
@@ -102,6 +115,9 @@ class InferenceModelProvider:
 
     def mark_updated(self, worker_id):
         self.updated_flags[worker_id] = False
+    
+    def stop(self):
+        self.stop_event.set()
 
 class ReplayBufferWriter(threading.Thread):
     def __init__(self, sample_queue, replay_buffer):
@@ -111,19 +127,20 @@ class ReplayBufferWriter(threading.Thread):
         self.stop_event = threading.Event()
 
     def run(self):
-        print(f"ReplayBufferWriter (ThreadID: {threading.get_ident()}) started.", flush=True)
+        print(f"ReplayBufferWriter started.", flush=True)
         while not self.stop_event.is_set():
             batch = self.sample_queue.pop()
             if batch is not None:
                 self.replay_buffer.push_batch(batch)
             elif self.stop_event.is_set():
                 break
-        print(f"ReplayBufferWriter (ThreadID: {threading.get_ident()}) stopped.", flush=True)
+        print(f"ReplayBufferWriter stopped.", flush=True)
 
     def stop(self):
         self.stop_event.set()
-        self.sample_queue.stop() # <-- ИЗМЕНЕНИЕ: Прерываем ожидание в C++ pop()
+        self.sample_queue.stop()
 
+# ... (push_to_github без изменений) ...
 def push_to_github(model_path, commit_message):
     try:
         print("Pushing progress to GitHub...", flush=True)
@@ -154,20 +171,21 @@ def main():
     criterion = nn.MSELoss()
 
     replay_buffer = SharedReplayBuffer(REPLAY_BUFFER_CAPACITY, ACTION_LIMIT)
-    inference_queue = InferenceQueue()
     sample_queue = SampleQueue()
+    request_queue = InferenceRequestQueue()
+    response_queue = InferenceResponseQueue()
 
     model_provider = InferenceModelProvider(model, device, NUM_INFERENCE_WORKERS)
     
-    print("Starting Python workers (Inference, ReplayBufferWriter)...", flush=True)
-    inference_workers = [InferenceWorker(model_provider, inference_queue, device, i) for i in range(NUM_INFERENCE_WORKERS)]
+    print("Starting Python workers...", flush=True)
+    inference_workers = [InferenceWorker(model_provider, request_queue, response_queue, device, i) for i in range(NUM_INFERENCE_WORKERS)]
     replay_buffer_writer = ReplayBufferWriter(sample_queue, replay_buffer)
     for worker in inference_workers:
         worker.start()
     replay_buffer_writer.start()
 
     stop_flag = AtomicBool(False)
-    solvers = [DeepMCCFR(ACTION_LIMIT, sample_queue, inference_queue, stop_flag) for _ in range(NUM_CPP_WORKERS)]
+    solvers = [DeepMCCFR(ACTION_LIMIT, sample_queue, request_queue, response_queue, stop_flag, i) for i in range(NUM_CPP_WORKERS)]
     
     git_thread = None
     futures = set()
@@ -176,7 +194,7 @@ def main():
     try:
         print(f"Submitting {NUM_CPP_WORKERS} C++ worker tasks...", flush=True)
         for s in solvers:
-            futures.add(executor.submit(s.run_traversal_loop))
+            futures.add(executor.submit(s.run_main_loop))
         
         print(f"Warm-up phase: waiting for Replay Buffer to contain at least {BATCH_SIZE} samples.", flush=True)
         while replay_buffer.get_count() < BATCH_SIZE:
@@ -214,7 +232,7 @@ def main():
             optimizer.step()
             training_steps += 1
             
-            if training_steps % 10 == 0:
+            if training_steps % 100 == 0: # Обновляем модель для инференса реже
                 model_provider.set_model(model)
             
             now = time.time()
@@ -254,13 +272,15 @@ def main():
         print("Stopping all workers...", flush=True)
         stop_flag.store(True)
         
-        model_provider.stop_event.set()
-        inference_queue.stop()
-        replay_buffer_writer.stop() # <-- Этот вызов теперь разбудит и C++ pop()
+        model_provider.stop()
+        for worker in inference_workers:
+            worker.stop()
+        
+        replay_buffer_writer.stop()
         
         if futures:
             print("Shutting down C++ worker pool...")
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=False)
 
         print("Waiting for Python workers to finish...")
         replay_buffer_writer.join(timeout=5)
