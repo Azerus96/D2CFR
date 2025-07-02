@@ -18,7 +18,7 @@ DeepMCCFR::DeepMCCFR(size_t action_limit, SampleQueue* sample_queue, InferenceRe
       next_node_id_(0)
 {
     local_buffer_.reserve(LOCAL_BUFFER_CAPACITY);
-    waiting_nodes_.reserve(4096); // Резервируем память для ожидающих узлов
+    waiting_nodes_.reserve(4096);
 }
 
 DeepMCCFR::~DeepMCCFR() {
@@ -43,23 +43,19 @@ void DeepMCCFR::flush_local_buffer() {
 }
 
 void DeepMCCFR::run_main_loop() {
-    // Запускаем начальные симуляции
     start_new_traversals();
 
     while (!stop_flag_->load(std::memory_order_relaxed)) {
         process_responses();
-        // Если мы обработали все ожидающие узлы, можно запустить новые симуляции
         if (waiting_nodes_.empty()) {
             start_new_traversals();
         }
-        // Небольшая пауза, если нет работы
         std::this_thread::sleep_for(std::chrono::microseconds(10));
     }
     flush_local_buffer();
 }
 
 void DeepMCCFR::start_new_traversals() {
-    // Запускаем 1024 независимых симуляций
     for (int i = 0; i < 1024; ++i) {
         GameState state;
         int player_to_traverse = (rng_() % 2);
@@ -80,7 +76,6 @@ void DeepMCCFR::process_responses() {
         int num_actions = waiting_node.legal_actions.size();
         std::vector<float> regrets = std::move(response.regrets);
         
-        // Рассчитываем стратегию
         float total_positive_regret = 0.0f;
         for (int i = 0; i < num_actions; ++i) {
             waiting_node.strategy[i] = (regrets[i] > 0) ? regrets[i] : 0.0f;
@@ -96,11 +91,11 @@ void DeepMCCFR::process_responses() {
         waiting_nodes_[node_id] = std::move(waiting_node);
 
         // Запускаем дочерние симуляции
-        GameState state_template; // Нужен только для apply_action
+        GameState state_template; 
         for (int i = 0; i < num_actions; ++i) {
-            GameState next_state = state_template; // Копируем, чтобы не портить оригинал
+            GameState next_state = state_template;
             UndoInfo undo_info;
-            next_state.apply_action(waiting_node.legal_actions[i], -1, undo_info); // player_view не важен
+            next_state.apply_action(waiting_nodes_[node_id].legal_actions[i], -1, undo_info);
             traverse(std::move(next_state), -1, ParentInfo{node_id, i});
         }
     }
@@ -115,7 +110,6 @@ void DeepMCCFR::backtrack_utility(const ParentInfo& parent_info, const std::map<
     parent_node.num_children_remaining--;
 
     if (parent_node.num_children_remaining == 0) {
-        // Все дочерние узлы вернули результат, можно завершить обработку этого узла
         for (size_t i = 0; i < parent_node.legal_actions.size(); ++i) {
             for (auto const& [player_idx, util] : parent_node.action_utils[i]) {
                 parent_node.node_util[player_idx] += parent_node.strategy[i] * util;
@@ -132,17 +126,17 @@ void DeepMCCFR::backtrack_utility(const ParentInfo& parent_info, const std::map<
             flush_local_buffer();
         }
         
-        // Удаляем завершенный узел
         waiting_nodes_.erase(it);
     }
 }
 
-
 void DeepMCCFR::traverse(GameState state, int traversing_player, std::optional<ParentInfo> parent_info) {
     if (state.is_terminal()) {
-        auto payoffs = state.get_payoffs(evaluator_);
+        auto payoffs_pair = state.get_payoffs(evaluator_);
         if (parent_info) {
-            backtrack_utility(*parent_info, payoffs);
+            // ИСПРАВЛЕНИЕ: Явно преобразуем std::pair в std::map
+            std::map<int, float> payoffs_map = {{0, payoffs_pair.first}, {1, payoffs_pair.second}};
+            backtrack_utility(*parent_info, payoffs_map);
         }
         return;
     }
@@ -152,6 +146,8 @@ void DeepMCCFR::traverse(GameState state, int traversing_player, std::optional<P
         std::vector<Action> legal_actions;
         state.get_legal_actions(action_limit_, legal_actions, rng_);
         if (legal_actions.empty()) {
+             UndoInfo undo_info;
+             state.apply_action({{}, INVALID_CARD}, traversing_player, undo_info);
              traverse(std::move(state), traversing_player, parent_info);
              return;
         }
@@ -162,12 +158,13 @@ void DeepMCCFR::traverse(GameState state, int traversing_player, std::optional<P
         return;
     }
 
-    // Узел, требующий решения
     std::vector<Action> legal_actions;
     state.get_legal_actions(action_limit_, legal_actions, rng_);
     int num_actions = legal_actions.size();
 
     if (num_actions == 0) {
+        UndoInfo undo_info;
+        state.apply_action({{}, INVALID_CARD}, traversing_player, undo_info);
         traverse(std::move(state), traversing_player, parent_info);
         return;
     }
@@ -175,7 +172,6 @@ void DeepMCCFR::traverse(GameState state, int traversing_player, std::optional<P
     NodeId node_id = (static_cast<uint64_t>(worker_id_) << 48) | next_node_id_.fetch_add(1);
     std::vector<float> infoset_vec = featurize(state, current_player);
 
-    // Создаем узел, ожидающий инференса
     WaitingNode node;
     node.num_children_remaining = num_actions;
     node.strategy.resize(num_actions);
@@ -187,7 +183,6 @@ void DeepMCCFR::traverse(GameState state, int traversing_player, std::optional<P
     
     waiting_nodes_[node_id] = std::move(node);
 
-    // Отправляем запрос на инференс
     request_queue_->push({node_id, std::move(infoset_vec), num_actions});
 }
 
